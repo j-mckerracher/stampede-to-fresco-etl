@@ -1,6 +1,8 @@
+import subprocess
 import threading
-from queue import Queue
 import os
+
+import numpy as np
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
@@ -8,27 +10,159 @@ import boto3
 from botocore.exceptions import ClientError
 import shutil
 import time
-import pandas as pd
 import glob
-import psutil
 import json
 from pathlib import Path
+import gc
+import psutil
+from typing import Dict
+import pandas as pd
+
+
+class DataVersionManager:
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.version_file = Path(base_dir) / "version_info.json"
+        self.load_version_info()
+
+    def load_version_info(self):
+        """Load or initialize version tracking data"""
+        if self.version_file.exists():
+            with open(self.version_file, 'r') as f:
+                self.version_info = json.load(f)
+        else:
+            self.version_info = {
+                'current_version': 1,
+                'uploaded_versions': []
+            }
+            self.save_version_info()
+
+    def save_version_info(self):
+        """Save version tracking data"""
+        with open(self.version_file, 'w') as f:
+            json.dump(self.version_info, f)
+
+    def get_current_version(self):
+        """Get current version number as string (v1, v2, etc)"""
+        return f"v{self.version_info['current_version']}"
+
+    def increment_version(self):
+        """Increment version number after successful upload"""
+        self.version_info['uploaded_versions'].append(self.version_info['current_version'])
+        self.version_info['current_version'] += 1
+        self.save_version_info()
+
+
+def check_critical_disk_space(warning_gb=50, critical_gb=20):
+    """
+    Check disk space status
+    Returns:
+        - (True, True) if space is fine
+        - (True, False) if warning level reached
+        - (False, False) if critical level reached
+    """
+    disk_usage = psutil.disk_usage('C:')
+    available_gb = disk_usage.free / (1024 ** 3)
+
+    return (
+        available_gb > critical_gb,  # is_safe
+        available_gb > warning_gb  # is_abundant
+    )
+
+
+def save_monthly_data_locally(monthly_data, base_dir, version_manager):
+    """
+    Save monthly data to local files, updating existing files if they exist
+    Returns list of saved file paths
+    """
+    output_dir = os.path.join(base_dir, "monthly_data")
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    version_suffix = version_manager.get_current_version()
+    saved_files = []
+
+    for month, new_df in monthly_data.items():
+        file_path = os.path.join(
+            output_dir,
+            f"FRESCO_Conte_ts_{month}_{version_suffix}.csv"
+        )
+
+        if os.path.exists(file_path):
+            # Read existing file and merge with new data
+            existing_df = pd.read_csv(file_path)
+            merged_df = pd.concat([existing_df, new_df]).drop_duplicates()
+            merged_df.to_csv(file_path, index=False)
+        else:
+            # Create new file
+            new_df.to_csv(file_path, index=False)
+
+        saved_files.append(file_path)
+
+    return saved_files
+
+
+def manage_storage_and_upload(monthly_data, base_dir, version_manager):
+    """
+    Manage local storage and S3 uploads based on disk space
+    Returns: bool indicating if upload was performed
+    """
+    is_safe, is_abundant = check_critical_disk_space()
+
+    if not is_safe:
+        print("\nCritical disk space reached. Initiating upload process...")
+        # Get all local files for current version
+        version_suffix = version_manager.get_current_version()
+        local_files = glob.glob(
+            os.path.join(base_dir, "monthly_data", f"*_{version_suffix}.csv")
+        )
+
+        # Upload to S3
+        if upload_to_s3(local_files):
+            print(f"Successfully uploaded {version_suffix} files to S3")
+            version_manager.increment_version()
+
+            # Clear monthly_data after successful upload
+            monthly_data.clear()
+            gc.collect()
+
+            return True
+        else:
+            print("Failed to upload to S3. Will retry when disk space is critical again.")
+            return False
+
+    elif not is_abundant:
+        print("\nWarning: Disk space is running low")
+
+    return False
 
 
 # Tracking and Safety Management Class
 class ProcessingTracker:
     def __init__(self, base_dir):
         self.base_dir = base_dir
+        # Ensure directory exists
+        if not os.path.exists(base_dir):
+            os.makedirs(base_dir)
         self.tracker_file = Path(base_dir) / "processing_status.json"
         self.batch_sizes_file = Path(base_dir) / "batch_sizes.json"
         self.load_status()
 
     def load_status(self):
         """Load or initialize tracking data"""
-        if self.tracker_file.exists():
-            with open(self.tracker_file, 'r') as f:
-                self.status = json.load(f)
-        else:
+        try:
+            if self.tracker_file.exists():
+                with open(self.tracker_file, 'r') as f:
+                    self.status = json.load(f)
+            else:
+                self.status = {
+                    'processed_nodes': [],
+                    'failed_nodes': [],
+                    'current_batch': 0
+                }
+        except json.JSONDecodeError:
+            # File exists but is corrupted/empty
+            print(f"Warning: {self.tracker_file} was corrupted, reinitializing tracking data")
             self.status = {
                 'processed_nodes': [],
                 'failed_nodes': [],
@@ -217,18 +351,24 @@ def scrape_and_download(base_url, save_dir, tracker, start_index=0):
         return None, False
 
 
-# [Keeping all existing processing functions exactly as they were]
 def process_block_file(file_path):
     """Process block.csv file and transform to FRESCO format"""
     df = pd.read_csv(file_path)
 
-    # Calculate value in GB/s (sectors are 512 bytes)
-    # Calculate bytes per second from sectors and ticks
-    df['Value'] = ((df['rd_sectors'] + df['wr_sectors']) * 512) / (df['rd_ticks'] + df['wr_ticks'])
+    # Calculate total sectors and ticks
+    df['total_sectors'] = df['rd_sectors'] + df['wr_sectors']
+    df['total_ticks_seconds'] = (df['rd_ticks'] + df['wr_ticks']) / 1000  # Convert ms to seconds
+
+    # Calculate bytes per second, handling potential division by zero
+    df['Value'] = np.where(
+        df['total_ticks_seconds'] > 0,
+        (df['total_sectors'] * 512) / df['total_ticks_seconds'],
+        0
+    )
+
     # Convert to GB/s
     df['Value'] = df['Value'] / (1024 * 1024 * 1024)
 
-    # Create FRESCO format
     # Ensure Job Id uses uppercase "JOB" and remove "ID" if present
     df['jobID'] = df['jobID'].str.replace('job', 'JOB', case=False).str.replace('ID', '')
 
@@ -248,9 +388,21 @@ def process_cpu_file(file_path):
     """Process cpu.csv file and transform to FRESCO format"""
     df = pd.read_csv(file_path)
 
-    # Calculate CPU usage percentage
-    total = df['user'] + df['nice'] + df['system'] + df['idle'] + df['iowait'] + df['irq'] + df['softirq']
-    df['Value'] = ((df['user'] + df['nice']) / total) * 100
+    # Calculate total CPU ticks
+    df['total_ticks'] = (
+            df['user'] + df['nice'] + df['system'] +
+            df['idle'] + df['iowait'] + df['irq'] + df['softirq']
+    )
+
+    # Calculate user CPU percentage (user + nice), handling edge cases
+    df['Value'] = np.where(
+        df['total_ticks'] > 0,
+        ((df['user'] + df['nice']) / df['total_ticks']) * 100,
+        0
+    )
+
+    # Ensure values don't exceed 100%
+    df['Value'] = df['Value'].clip(0, 100)
 
     # Ensure Job Id uses uppercase "JOB" and remove "ID" if present
     df['jobID'] = df['jobID'].str.replace('job', 'JOB', case=False).str.replace('ID', '')
@@ -271,9 +423,16 @@ def process_nfs_file(file_path):
     """Process nfs.csv file and transform to FRESCO format"""
     df = pd.read_csv(file_path)
 
-    # Calculate NFS throughput in MB/s
-    # Using direct read/write columns
-    df['Value'] = (df['direct_read'] + df['direct_write']) / 1024 / 1024  # Convert to MB/s
+    # Calculate NFS throughput in MB/s using actual NFS operation bytes
+    # Sum of READ bytes received and WRITE bytes sent
+    df['Value'] = (df['READ_bytes_recv'] + df['WRITE_bytes_sent']) / (1024 * 1024)  # Convert to MB
+
+    # Calculate the time difference to get proper rate
+    df['Timestamp'] = pd.to_datetime(df['timestamp'])
+    df['TimeDiff'] = df['Timestamp'].diff().dt.total_seconds().fillna(600)  # Default to 600s (10 min) for first row
+
+    # Convert to rate (MB/s)
+    df['Value'] = df['Value'] / df['TimeDiff']
 
     # Ensure Job Id uses uppercase "JOB" and remove "ID" if present
     df['jobID'] = df['jobID'].str.replace('job', 'JOB', case=False).str.replace('ID', '')
@@ -284,35 +443,89 @@ def process_nfs_file(file_path):
         'Event': 'nfs',
         'Value': df['Value'],
         'Units': 'MB/s',
-        'Timestamp': pd.to_datetime(df['timestamp'])
+        'Timestamp': df['Timestamp']
     })
 
     return result
 
 
 def process_node_folder(folder_path):
-    """Process a single node folder and return combined data"""
+    """Process a single node folder with memory management"""
     results = []
 
-    # Process block.csv
-    block_file = os.path.join(folder_path, 'block.csv')
-    if os.path.exists(block_file):
-        results.append(process_block_file(block_file))
+    # Process block, cpu, and nfs files
+    for file_type in ['block', 'cpu', 'nfs']:
+        file_path = os.path.join(folder_path, f'{file_type}.csv')
+        if os.path.exists(file_path):
+            # Process one file at a time
+            result = globals()[f'process_{file_type}_file'](file_path)
+            results.append(result)
+            # Force garbage collection after each file
+            del result
+            gc.collect()
 
-    # Process cpu.csv
-    cpu_file = os.path.join(folder_path, 'cpu.csv')
-    if os.path.exists(cpu_file):
-        results.append(process_cpu_file(cpu_file))
+    # Process memory metrics separately since they produce two dataframes
+    mem_file_path = os.path.join(folder_path, 'mem.csv')
+    if os.path.exists(mem_file_path):
+        memused_df, memused_nocache_df = process_memory_metrics(mem_file_path)
+        results.append(memused_df)
+        results.append(memused_nocache_df)
+        # Force garbage collection
+        del memused_df
+        del memused_nocache_df
+        gc.collect()
 
-    # Process nfs.csv
-    nfs_file = os.path.join(folder_path, 'nfs.csv')
-    if os.path.exists(nfs_file):
-        results.append(process_nfs_file(nfs_file))
-
-    # Combine all results
     if results:
-        return pd.concat(results, ignore_index=True)
+        final_result = pd.concat(results, ignore_index=True)
+        return final_result
     return None
+
+
+def process_memory_metrics(file_path):
+    """Process mem.csv file and transform to FRESCO format for both memory metrics"""
+    df = pd.read_csv(file_path)
+
+    # Ensure all memory values are in bytes before conversion
+    # Note: Memory values in /proc/meminfo are typically in KB, multiply by 1024
+    memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
+    for col in memory_cols:
+        if col in df.columns:
+            df[col] = df[col] * 1024  # Convert KB to bytes
+
+    # Calculate memused (total physical memory usage)
+    # Convert to GB for output
+    df['memused'] = df['MemUsed'] / (1024 * 1024 * 1024)
+
+    # Calculate memused_minus_diskcache
+    # Memory used minus file cache (FilePages)
+    df['memused_minus_diskcache'] = (df['MemUsed'] - df['FilePages']) / (1024 * 1024 * 1024)
+
+    # Ensure values don't go below 0
+    df['memused_minus_diskcache'] = df['memused_minus_diskcache'].clip(lower=0)
+
+    # Ensure Job Id uses uppercase "JOB" and remove "ID" if present
+    df['jobID'] = df['jobID'].str.replace('job', 'JOB', case=False).str.replace('ID', '')
+
+    # Create output dataframes for both metrics
+    memused_df = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused',
+        'Value': df['memused'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    memused_nocache_df = pd.DataFrame({
+        'Job Id': df['jobID'],
+        'Host': df['node'],
+        'Event': 'memused_minus_diskcache',
+        'Value': df['memused_minus_diskcache'],
+        'Units': 'GB',
+        'Timestamp': pd.to_datetime(df['timestamp'])
+    })
+
+    return memused_df, memused_nocache_df
 
 
 def split_by_month(df):
@@ -344,23 +557,7 @@ def update_monthly_data(existing_data, new_data):
     return existing_data
 
 
-def save_monthly_data_locally(monthly_data, base_dir):
-    """
-    Save monthly data to local temporary files
-    """
-    temp_dir = os.path.join(base_dir, "temp_monthly_data")
-    create_directory(temp_dir)
-
-    saved_files = []
-    for month, df in monthly_data.items():
-        file_path = os.path.join(temp_dir, f"FRESCO_Stampede_ts_{month}.csv")
-        df.to_csv(file_path, index=False)
-        saved_files.append(file_path)
-
-    return saved_files
-
-
-def upload_to_s3(file_paths, bucket_name="abc123", max_retries=3):
+def upload_to_s3(file_paths, bucket_name="data-transform-stampede", max_retries=3):
     """
     Upload files to S3 bucket with retry logic.
     Returns True if all uploads successful, False otherwise.
@@ -388,7 +585,7 @@ def upload_to_s3(file_paths, bucket_name="abc123", max_retries=3):
     return True
 
 
-def upload_monthly_data(monthly_data, base_dir, bucket_name="abc123", max_retries=3):
+def upload_monthly_data(monthly_data, base_dir, bucket_name="data-transform-stampede", max_retries=3):
     """
     Upload final monthly data to S3
     """
@@ -423,16 +620,34 @@ def cleanup_files(dirs_to_delete):
                 print(f"Error deleting {dir_path}: {str(e)}")
 
 
+def check_memory_usage(threshold_percent=90):
+    """Check if memory usage is too high"""
+    memory = psutil.virtual_memory()
+    return memory.percent < threshold_percent
+
+
+def get_base_dir():
+    """Get the current working directory using pwd"""
+    try:
+        result = subprocess.run(['pwd'], capture_output=True, text=True)
+        base_dir = result.stdout.strip()
+        return base_dir
+    except Exception as e:
+        print(f"Error getting base directory: {str(e)}")
+        return os.getcwd()  # Fallback to os.getcwd()
+
+
 def main():
     """
-    Main function to orchestrate the entire pipeline
+    Main function with version-aware storage management
     """
-    base_dir = r"transform-data"
+    base_dir = get_base_dir()
     base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/"
 
-    # Initialize tracker and monthly data storage
+    # Initialize trackers
     tracker = ProcessingTracker(base_dir)
-    monthly_data = {}
+    version_manager = DataVersionManager(base_dir)
+    monthly_data: Dict[str, pd.DataFrame] = {}
 
     start_index = 0
     batch_number = tracker.status['current_batch']
@@ -440,39 +655,50 @@ def main():
     while True:
         print(f"\nProcessing batch {batch_number}...")
 
-        # Check disk space
-        if not check_disk_space():
-            print("Insufficient disk space. Saving progress and exiting.")
-            if monthly_data:
-                upload_monthly_data(monthly_data, base_dir)
-            break
+        # Check if we need to upload and version
+        manage_storage_and_upload(monthly_data, base_dir, version_manager)
 
-        next_index, has_more = scrape_and_download(base_url, base_dir, tracker, start_index)
-
-        if next_index is None:
-            print("No more folders to process or error occurred.")
+        # Stop if disk space is critically low and upload failed
+        is_safe, _ = check_critical_disk_space()
+        if not is_safe and monthly_data:
+            print("Critical disk space and upload failed. Must stop processing.")
             break
 
         try:
+            next_index, has_more = scrape_and_download(base_url, base_dir, tracker, start_index)
+
+            if next_index is None:
+                print("No more folders to process or error occurred.")
+                break
+
             # Process the current batch
             node_folders = glob.glob(os.path.join(base_dir, "NODE*"))
-            batch_results = []
 
             for folder in node_folders:
-                result = process_node_folder(folder)
-                if result is not None:
-                    batch_results.append(result)
+                try:
+                    print(f"Processing folder: {folder}")
+                    result = process_node_folder(folder)
 
-            if batch_results:
-                # Combine batch results
-                batch_df = pd.concat(batch_results, ignore_index=True)
+                    if result is not None:
+                        # Process one folder's results immediately
+                        batch_monthly = split_by_month(result)
+                        monthly_data = update_monthly_data(monthly_data, batch_monthly)
 
-                # Split by month and update monthly data
-                batch_monthly = split_by_month(batch_df)
-                monthly_data = update_monthly_data(monthly_data, batch_monthly)
+                        # Save to local storage
+                        save_monthly_data_locally(batch_monthly, base_dir, version_manager)
 
-                # Clean up node folders after processing
-                cleanup_files([folder for folder in node_folders])
+                        # Clear memory
+                        del result
+                        del batch_monthly
+                        gc.collect()
+
+                    # Clean up temporary folder
+                    cleanup_files([folder])
+
+                except Exception as folder_error:
+                    print(f"Error processing folder {folder}: {str(folder_error)}")
+                    cleanup_files([folder])
+                    continue
 
             # Update progress
             tracker.status['current_batch'] = batch_number
@@ -482,22 +708,80 @@ def main():
                 start_index = next_index
                 batch_number += 1
             else:
-                # All nodes processed, upload final data to S3
+                # All nodes processed
                 if monthly_data:
-                    upload_success = upload_monthly_data(monthly_data, base_dir)
-                    if upload_success:
-                        print("All data successfully processed and uploaded!")
-                    else:
-                        print("Error uploading final data to S3")
+                    # Save final batch locally
+                    save_monthly_data_locally(monthly_data, base_dir, version_manager)
                 print("All folders have been processed!")
                 break
 
         except Exception as e:
             print(f"Error processing batch {batch_number}: {str(e)}")
-            # Try to save current progress before exiting
+            # Save current progress locally
             if monthly_data:
-                upload_monthly_data(monthly_data, base_dir)
+                try:
+                    save_monthly_data_locally(monthly_data, base_dir, version_manager)
+                except Exception as save_error:
+                    print(f"Error saving progress: {str(save_error)}")
             break
+
+        time.sleep(5)  # Small delay between batches
+
+    print("Script execution completed.")
+
+
+def test_data_processing():
+    # Set up test directory
+    test_dir = r"C:\Users\jmckerra\PycharmProjects\scratch\FRESCO-Paper-Code\transform-data-test"
+    if not os.path.exists(test_dir):
+        os.makedirs(test_dir)
+
+    # Initialize version manager
+    version_manager = DataVersionManager(test_dir)
+    print(f"Initial version: {version_manager.get_current_version()}")
+
+    # Create some test data
+    test_data = {
+        '2024_01': pd.DataFrame({
+            'Job Id': ['JOB1', 'JOB2'],
+            'Host': ['node1', 'node2'],
+            'Event': ['block', 'cpu'],
+            'Value': [1.2, 3.4],
+            'Units': ['GB/s', 'CPU %'],
+            'Timestamp': pd.date_range('2024-01-01', periods=2)
+        }),
+        '2024_02': pd.DataFrame({
+            'Job Id': ['JOB3', 'JOB4'],
+            'Host': ['node3', 'node4'],
+            'Event': ['nfs', 'block'],
+            'Value': [2.3, 4.5],
+            'Units': ['MB/s', 'GB/s'],
+            'Timestamp': pd.date_range('2024-02-01', periods=2)
+        })
+    }
+
+    # Test saving data locally
+    print("\nSaving test data locally...")
+    saved_files = save_monthly_data_locally(test_data, test_dir, version_manager)
+    print(f"Saved files: {saved_files}")
+
+    # Verify files exist
+    print("\nVerifying saved files...")
+    for file_path in saved_files:
+        if os.path.exists(file_path):
+            print(f"File exists: {file_path}")
+            print(f"File size: {os.path.getsize(file_path)} bytes")
+
+    # Test S3 upload (optional)
+    print("\nTesting S3 upload...")
+    upload_success = upload_to_s3(saved_files)
+    print(f"Upload success: {upload_success}")
+
+    if upload_success:
+        version_manager.increment_version()
+        print(f"New version after upload: {version_manager.get_current_version()}")
+
+    return "Test completed successfully"
 
 
 if __name__ == "__main__":
