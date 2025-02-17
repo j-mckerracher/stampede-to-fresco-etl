@@ -85,7 +85,7 @@ def save_monthly_data_locally(monthly_data, base_dir, version_manager):
     for month, new_df in monthly_data.items():
         file_path = os.path.join(
             output_dir,
-            f"FRESCO_Conte_ts_{month}_{version_suffix}.csv"
+            f"FRESCO_Stampede_ts_{month}_{version_suffix}.csv"
         )
 
         if os.path.exists(file_path):
@@ -254,11 +254,12 @@ def download_file(url, local_path, max_retries=3, retry_delay=5):
 
 def download_node_folder(node_info, save_dir, tracker):
     """
-    Downloads all CSV files for a single node folder.
+    Downloads only the required CSV files (block, cpu, nfs, mem) for a single node folder.
     To be run in a separate thread.
     """
     link, node_url = node_info
     node_name = link.text.strip('/')
+    required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
 
     try:
         if tracker.is_node_processed(node_name):
@@ -273,25 +274,34 @@ def download_node_folder(node_info, save_dir, tracker):
         node_soup = BeautifulSoup(node_response.text, 'html.parser')
 
         download_success = True
+        files_found = 0
+
         for csv_link in node_soup.find_all('a'):
-            if csv_link.text.endswith('.csv'):
+            if csv_link.text in required_files:
                 csv_url = urljoin(node_url, csv_link['href'])
                 csv_path = os.path.join(node_dir, csv_link.text)
                 if not download_file(csv_url, csv_path):
                     download_success = False
                     break
+                files_found += 1
                 time.sleep(0.5)  # Small delay between files
 
-        if download_success:
-            print(f"Completed downloading files for {node_name}")
+        if download_success and files_found == len(required_files):
+            print(f"Completed downloading required files for {node_name}")
             tracker.mark_node_processed(node_name)
         else:
-            print(f"Failed to download some files for {node_name}")
+            print(f"Failed to download all required files for {node_name}")
             tracker.mark_node_failed(node_name)
+            # Clean up partial downloads
+            if os.path.exists(node_dir):
+                shutil.rmtree(node_dir)
 
     except Exception as e:
         print(f"Error downloading node folder {node_name}: {str(e)}")
         tracker.mark_node_failed(node_name)
+        # Clean up in case of error
+        if os.path.exists(node_dir):
+            shutil.rmtree(node_dir)
 
 
 def scrape_and_download(base_url, save_dir, tracker, start_index=0):
@@ -634,6 +644,7 @@ def get_base_dir():
         return base_dir
     except Exception as e:
         print(f"Error getting base directory: {str(e)}")
+        print(f"Using: {os.getcwd()}")
         return os.getcwd()  # Fallback to os.getcwd()
 
 
@@ -732,7 +743,7 @@ def main():
 
 def test_data_processing():
     # Set up test directory
-    test_dir = r"C:\Users\jmckerra\PycharmProjects\scratch\FRESCO-Paper-Code\transform-data-test"
+    test_dir = r""
     if not os.path.exists(test_dir):
         os.makedirs(test_dir)
 

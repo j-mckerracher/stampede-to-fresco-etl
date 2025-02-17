@@ -1,0 +1,2 @@
+jobID,user,account,jobname,queue,walltime,exit_status,start,end,submit,nnodes,ncpus
+jobID8720846,USER5374,ACCOUNT124,JOB298,QUEUE4,2880,CANCELLED,06/30/2018 15:39:57,06/30/2018 15:39:57,06/30/2018 15:39:32,0,32
