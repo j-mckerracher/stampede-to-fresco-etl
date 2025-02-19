@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
+import psutil
 import requests
 from bs4 import BeautifulSoup
 
@@ -48,26 +49,30 @@ def get_user_disk_usage():
 
 
 def log_disk_usage():
-    """Log current disk usage statistics based on quota command"""
-    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+    """Log current disk usage statistics"""
+    try:
+        disk_usage = psutil.disk_usage(os.getcwd())
 
-    if used_mb is not None and quota_mb is not None:
-        quota_used_pct = (used_mb / quota_mb) * 100
-        available_mb = quota_mb - used_mb
+        # Convert to more readable units
+        used_gb = disk_usage.used / (1024 ** 3)
+        free_gb = disk_usage.free / (1024 ** 3)
+        total_gb = disk_usage.total / (1024 ** 3)
+        percent_used = disk_usage.percent
 
         logging.info(
-            f"Disk Usage - Used: {used_mb:.2f}MB, "
-            f"Available: {available_mb:.2f}MB, "
-            f"Quota: {quota_mb:.2f}MB, "
-            f"Quota Used: {quota_used_pct:.1f}%"
+            f"Disk Usage - Used: {used_gb:.2f}GB, "
+            f"Free: {free_gb:.2f}GB, "
+            f"Total: {total_gb:.2f}GB, "
+            f"Percent Used: {percent_used:.1f}%"
         )
 
-        if quota_used_pct > 85:
-            logging.warning(f"High disk usage: {quota_used_pct:.1f}% of quota used!")
+        if percent_used > 85:
+            logging.warning(f"High disk usage: {percent_used:.1f}% of space used!")
 
-        return quota_used_pct
-    else:
-        logging.error("Could not determine disk usage")
+        return percent_used
+
+    except Exception as e:
+        logging.error(f"Error determining disk usage: {e}")
         return None
 
 

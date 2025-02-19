@@ -21,29 +21,6 @@ from helpers.data_version_manager import DataVersionManager
 from helpers.utilities import log_disk_usage, cleanup_temp_files, setup_quota_logging
 
 
-def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
-    """
-    Check disk space status based on quota and thresholds
-    Returns:
-        - (True, True) if space is fine
-        - (True, False) if warning level reached
-        - (False, False) if critical level reached
-    """
-    # Use current directory instead of hardcoded drive
-    current_dir = os.path.abspath(os.curdir)
-    disk_usage = psutil.disk_usage(current_dir)
-    available_mb = disk_usage.free / (1024 * 1024)  # Convert to MB
-
-    # Calculate thresholds based on quota percentage
-    warning_mb = quota_mb * (warning_threshold_pct / 100)
-    critical_mb = quota_mb * (critical_threshold_pct / 100)
-
-    return (
-        available_mb > critical_mb,  # is_safe
-        available_mb > warning_mb  # is_abundant
-    )
-
-
 def save_monthly_data_locally(monthly_data, base_dir, version_manager):
     """
     Save monthly data to local files, updating existing files if they exist
@@ -187,19 +164,54 @@ class ProcessingTracker:
 
 
 # Safety Check Functions
-def check_disk_space(required_space_mb=1024):  # Default 1GB in MB
+def check_disk_space(required_space_mb=1024):
     """
-    Check if there's enough disk space available based on quota
+    Check if there's enough disk space available
     Returns True if enough space, False otherwise
     """
-    used_mb, quota_mb, _ = get_user_disk_usage()
+    try:
+        # Get disk usage for the current directory
+        disk_usage = psutil.disk_usage(os.getcwd())
 
-    if used_mb is None or quota_mb is None:
-        logging.error("Could not check available space - assuming insufficient space")
+        # Convert bytes to MB
+        available_mb = disk_usage.free / (1024 * 1024)
+
+        logging.info(f"Available disk space: {available_mb:.2f}MB")
+        return available_mb > required_space_mb
+
+    except Exception as e:
+        logging.error(f"Error checking disk space: {e}")
         return False
 
-    available_mb = quota_mb - used_mb
-    return available_mb > required_space_mb
+
+def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=90):
+    """
+    Check disk space status
+    Returns:
+        - (True, True) if space is fine
+        - (True, False) if warning level reached
+        - (False, False) if critical level reached
+    """
+    try:
+        # Get disk usage for the current directory
+        disk_usage = psutil.disk_usage(os.getcwd())
+
+        # Calculate percentage used
+        percent_used = disk_usage.percent
+
+        # Log current disk usage
+        free_gb = disk_usage.free / (1024 ** 3)  # Convert to GB
+        total_gb = disk_usage.total / (1024 ** 3)
+        logging.info(f"Disk Usage - Free: {free_gb:.2f}GB, Total: {total_gb:.2f}GB, Used: {percent_used:.1f}%")
+
+        return (
+            percent_used < critical_threshold_pct,  # is_safe
+            percent_used < warning_threshold_pct  # is_abundant
+        )
+
+    except Exception as e:
+        logging.error(f"Error checking disk space: {e}")
+        return False, False
 
 
 def get_user_disk_usage():
