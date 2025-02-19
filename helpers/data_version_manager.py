@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 import json
 
@@ -11,8 +12,16 @@ class DataVersionManager:
     def load_version_info(self):
         """Load or initialize version tracking data"""
         if self.version_file.exists():
-            with open(self.version_file, 'r') as f:
-                self.version_info = json.load(f)
+            try:
+                with open(self.version_file, 'r') as f:
+                    self.version_info = json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                # Initialize with default values if file is empty or invalid
+                self.version_info = {
+                    "current_version": 1,
+                    "last_updated": datetime.now().isoformat()
+                }
+                self.save_version_info()
         else:
             self.version_info = {
                 'current_version': 1,
