@@ -1,6 +1,6 @@
-import gc
 import os
 import queue
+import signal
 import threading
 import time
 from multiprocessing import Pool, cpu_count
@@ -28,6 +28,25 @@ class DataProcessor:
 
         # Create process pool for CPU-intensive operations
         self.process_pool = Pool(processes=self.max_process_threads)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        signal.signal(signal.SIGINT, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print(f"\nReceived signal {signum}. Shutting down gracefully...")
+        self.stop_event.set()
+
+        # Add None to queues to signal workers to stop
+        for _ in range(self.max_download_threads):
+            self.download_queue.put(None)
+        for _ in range(self.max_process_threads):
+            self.process_queue.put(None)
+
+        # Clean up process pool
+        if hasattr(self, 'process_pool'):
+            self.process_pool.close()
+            self.process_pool.terminate()
+            self.process_pool.join()
 
     def _processor_worker(self):
         """Worker thread for processing node folders"""

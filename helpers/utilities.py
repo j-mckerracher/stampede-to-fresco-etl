@@ -11,13 +11,15 @@ from bs4 import BeautifulSoup
 
 def check_critical_disk_space(warning_gb=50, critical_gb=20):
     """
-    Check disk space status
+    Check disk space status for the current directory
     Returns:
         - (True, True) if space is fine
         - (True, False) if warning level reached
         - (False, False) if critical level reached
     """
-    disk_usage = psutil.disk_usage('C:')
+    # Get the directory where the script is running
+    current_dir = os.path.abspath(os.curdir)
+    disk_usage = psutil.disk_usage(current_dir)
     available_gb = disk_usage.free / (1024 ** 3)
 
     return (
@@ -33,11 +35,12 @@ def get_base_dir():
 
 def check_disk_space(required_space_gb=10):
     """
-    Check if there's enough disk space available
+    Check if there's enough disk space available in current directory
     Returns True if enough space, False otherwise
     """
-    disk_usage = psutil.disk_usage('C:')
-    available_gb = disk_usage.free / (1024 ** 3)  # Convert to GB
+    current_dir = os.path.abspath(os.curdir)
+    disk_usage = psutil.disk_usage(current_dir)
+    available_gb = disk_usage.free / (1024 ** 3)
     return available_gb > required_space_gb
 
 
