@@ -403,30 +403,6 @@ class NodeDownloader:
                 self.quota_manager.release_space(file_size // (1024 * 1024) + 1)
 
 
-def main():
-    """Main entry point"""
-    base_dir = os.getenv('ETL_BASE_DIR', '/path/to/base/dir')
-    base_url = os.getenv(
-        'ETL_BASE_URL',
-        'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
-    )
-    quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
-    bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
-
-    pipeline = ETLPipeline(
-        base_url=base_url,
-        base_dir=base_dir,
-        quota_mb=quota_mb,
-        bucket_name=bucket_name
-    )
-
-    pipeline.run()
-
-
-if __name__ == '__main__':
-    main()
-
-
 class ETLPipeline:
     """Main ETL pipeline implementation"""
 
@@ -688,3 +664,26 @@ class ETLPipeline:
 
             logging.info("ETL pipeline completed")
 
+
+def main():
+    """Main entry point"""
+    base_dir = os.getenv('ETL_BASE_DIR', '/path/to/base/dir')
+    base_url = os.getenv(
+        'ETL_BASE_URL',
+        'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
+    )
+    quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
+    bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
+
+    pipeline = ETLPipeline(
+        base_url=base_url,
+        base_dir=base_dir,
+        quota_mb=quota_mb,
+        bucket_name=bucket_name
+    )
+
+    pipeline.run()
+
+
+if __name__ == '__main__':
+    main()
