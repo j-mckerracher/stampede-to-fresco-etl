@@ -1,3 +1,4 @@
+import logging
 import subprocess
 import threading
 import os
@@ -17,6 +18,7 @@ import psutil
 from typing import Dict
 import pandas as pd
 from helpers.data_version_manager import DataVersionManager
+from helpers.utilities import log_disk_usage, cleanup_temp_files, setup_quota_logging
 
 
 def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
@@ -614,93 +616,107 @@ def main():
     """
     Main function with version-aware storage management
     """
-    base_dir = get_base_dir()
-    base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/"
+    try:
+        base_dir = get_base_dir()
+        base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/"
 
-    # Initialize trackers
-    tracker = ProcessingTracker(base_dir)
-    version_manager = DataVersionManager(base_dir)
-    monthly_data: Dict[str, pd.DataFrame] = {}
+        # Set up logging and log initial state
+        setup_quota_logging(base_dir)
+        logging.info("Starting script execution")
+        log_disk_usage()
 
-    start_index = 0
-    batch_number = tracker.status['current_batch']
+        # Initialize trackers
+        tracker = ProcessingTracker(base_dir)
+        version_manager = DataVersionManager(base_dir)
+        monthly_data: Dict[str, pd.DataFrame] = {}
 
-    while True:
-        print(f"\nProcessing batch {batch_number}...")
+        start_index = 0
+        batch_number = tracker.status['current_batch']
 
-        # Check if we need to upload and version
-        manage_storage_and_upload(monthly_data, base_dir, version_manager)
+        while True:
+            logging.info(f"\nProcessing batch {batch_number}...")
 
-        # Stop if disk space is critically low and upload failed
-        is_safe, _ = check_critical_disk_space()
-        if not is_safe and monthly_data:
-            print("Critical disk space and upload failed. Must stop processing.")
-            break
-
-        try:
-            next_index, has_more = scrape_and_download(base_url, base_dir, tracker, start_index)
-
-            if next_index is None:
-                print("No more folders to process or error occurred.")
-                break
-
-            # Process the current batch
-            node_folders = glob.glob(os.path.join(base_dir, "NODE*"))
-
-            for folder in node_folders:
-                try:
-                    print(f"Processing folder: {folder}")
-                    result = process_node_folder(folder)
-
-                    if result is not None:
-                        # Process one folder's results immediately
-                        batch_monthly = split_by_month(result)
-                        monthly_data = update_monthly_data(monthly_data, batch_monthly)
-
-                        # Save to local storage
-                        save_monthly_data_locally(batch_monthly, base_dir, version_manager)
-
-                        # Clear memory
-                        del result
-                        del batch_monthly
-                        gc.collect()
-
-                    # Clean up temporary folder
-                    cleanup_files([folder])
-
-                except Exception as folder_error:
-                    print(f"Error processing folder {folder}: {str(folder_error)}")
-                    cleanup_files([folder])
-                    continue
-
-            # Update progress
-            tracker.status['current_batch'] = batch_number
-            tracker.save_status()
-
-            if has_more:
-                start_index = next_index
-                batch_number += 1
-            else:
-                # All nodes processed
+            # Check storage and handle uploads in one operation
+            if not manage_storage_and_upload(monthly_data, base_dir, version_manager):
+                logging.error("Storage management failed. Saving progress and stopping.")
                 if monthly_data:
-                    # Save final batch locally
                     save_monthly_data_locally(monthly_data, base_dir, version_manager)
-                print("All folders have been processed!")
                 break
 
-        except Exception as e:
-            print(f"Error processing batch {batch_number}: {str(e)}")
-            # Save current progress locally
-            if monthly_data:
-                try:
-                    save_monthly_data_locally(monthly_data, base_dir, version_manager)
-                except Exception as save_error:
-                    print(f"Error saving progress: {str(save_error)}")
-            break
+            try:
+                next_index, has_more = scrape_and_download(base_url, base_dir, tracker, start_index)
 
-        time.sleep(5)  # Small delay between batches
+                if next_index is None:
+                    logging.info("No more folders to process or error occurred.")
+                    break
 
-    print("Script execution completed.")
+                # Process the current batch
+                node_folders = glob.glob(os.path.join(base_dir, "NODE*"))
+
+                for folder in node_folders:
+                    try:
+                        logging.info(f"Processing folder: {folder}")
+                        result = process_node_folder(folder)
+
+                        if result is not None:
+                            # Process one folder's results immediately
+                            batch_monthly = split_by_month(result)
+                            monthly_data = update_monthly_data(monthly_data, batch_monthly)
+
+                            # Save to local storage
+                            save_monthly_data_locally(batch_monthly, base_dir, version_manager)
+
+                            # Clear memory
+                            del result
+                            del batch_monthly
+                            gc.collect()
+
+                        # Clean up temporary folder
+                        cleanup_files([folder])
+
+                    except Exception as folder_error:
+                        logging.error(f"Error processing folder {folder}: {str(folder_error)}")
+                        cleanup_files([folder])
+                        continue
+
+                # Update progress
+                tracker.status['current_batch'] = batch_number
+                tracker.save_status()
+
+                if has_more:
+                    start_index = next_index
+                    batch_number += 1
+                else:
+                    # All nodes processed
+                    if monthly_data:
+                        # Save final batch locally
+                        save_monthly_data_locally(monthly_data, base_dir, version_manager)
+                    logging.info("All folders have been processed!")
+                    break
+
+            except Exception as e:
+                logging.error(f"Error processing batch {batch_number}: {str(e)}")
+                # Save current progress locally
+                if monthly_data:
+                    try:
+                        save_monthly_data_locally(monthly_data, base_dir, version_manager)
+                    except Exception as save_error:
+                        logging.error(f"Error saving progress: {str(save_error)}")
+                break
+
+            # Small delay between batches
+            time.sleep(5)
+
+    except Exception as e:
+        logging.error(f"Fatal error in main execution: {str(e)}")
+        raise
+    finally:
+        # Ensure cleanup happens after script completion or failure
+        logging.info("Performing final cleanup")
+        space_freed = cleanup_temp_files(base_dir)
+        logging.info(f"Final cleanup freed {space_freed:.2f}MB")
+        log_disk_usage()  # Log final disk usage state
+        logging.info("Script execution completed")
 
 
 def test_data_processing():
