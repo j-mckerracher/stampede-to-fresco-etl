@@ -54,7 +54,7 @@ def save_monthly_data_locally(monthly_data, base_dir, version_manager):
 def manage_storage_and_upload(monthly_data, base_dir, version_manager):
     """
     Manage local storage and S3 uploads based on disk space
-    Returns: bool indicating if upload was performed
+    Returns: bool indicating if processing should continue
     """
     is_safe, is_abundant = check_critical_disk_space()
 
@@ -81,9 +81,9 @@ def manage_storage_and_upload(monthly_data, base_dir, version_manager):
             return False
 
     elif not is_abundant:
-        print("\nWarning: Disk space is running low")
+        print("\nWarning: Disk space is running low, but still safe to proceed")
 
-    return False
+    return True  # Return True to allow processing to continue when space is fine
 
 
 # Tracking and Safety Management Class

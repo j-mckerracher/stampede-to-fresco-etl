@@ -107,7 +107,9 @@ class DataManager:
             if space_freed > 0:
                 logging.info(f"Proactively cleaned up temporary files, freed {space_freed:.2f}MB")
 
-        return True
+        # If we get here, storage is fine (either abundant or at least safe)
+        logging.info("Storage check passed - proceeding with processing")
+        return True  # Return True to allow processing to continue
 
     def load_checkpoint(self):
         """Load monthly data from checkpoint"""
