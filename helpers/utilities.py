@@ -1,13 +1,122 @@
 import gc
+import logging
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
 import psutil
 import requests
 from bs4 import BeautifulSoup
+
+
+def setup_quota_logging(base_dir: str):
+    """Configure logging for disk quota monitoring"""
+    log_dir = Path(base_dir) / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    log_file = log_dir / f"disk_usage_{datetime.now().strftime('%Y%m')}.log"
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # Also print to console
+        ]
+    )
+
+
+def log_disk_usage(quota_mb=24512):
+    """Log current disk usage statistics"""
+    current_dir = os.path.abspath(os.curdir)
+    disk_usage = psutil.disk_usage(current_dir)
+
+    used_mb = (disk_usage.total - disk_usage.free) / (1024 * 1024)
+    available_mb = disk_usage.free / (1024 * 1024)
+    quota_used_pct = (used_mb / quota_mb) * 100
+
+    logging.info(
+        f"Disk Usage - Used: {used_mb:.2f}MB, "
+        f"Available: {available_mb:.2f}MB, "
+        f"Quota Used: {quota_used_pct:.1f}%"
+    )
+
+    if quota_used_pct > 85:
+        logging.warning(f"High disk usage: {quota_used_pct:.1f}% of quota used!")
+
+    return quota_used_pct
+
+
+def find_temp_files(base_dir: str, older_than_hours: int = 24) -> list:
+    """Find temporary files older than specified hours"""
+    temp_patterns = [
+        "*.tmp",
+        "temp_*",
+        "*.temp",
+        "~*",
+        "*.bak",
+        "*.swp"
+    ]
+
+    current_time = datetime.now().timestamp()
+    old_files = []
+
+    base_path = Path(base_dir)
+    for pattern in temp_patterns:
+        for file_path in base_path.rglob(pattern):
+            if file_path.is_file():
+                file_age = current_time - file_path.stat().st_mtime
+                if file_age > (older_than_hours * 3600):
+                    old_files.append(file_path)
+
+    return old_files
+
+
+def cleanup_temp_files(base_dir: str) -> int:
+    """Clean up temporary files and return space freed in MB"""
+    space_freed = 0
+    for file_path in find_temp_files(base_dir):
+        try:
+            size = file_path.stat().st_size
+            file_path.unlink()
+            space_freed += size
+            logging.info(f"Cleaned up temporary file: {file_path}")
+        except Exception as e:
+            logging.error(f"Failed to remove temporary file {file_path}: {e}")
+
+    return space_freed / (1024 * 1024)  # Convert to MB
+
+
+def cleanup_files(dirs_to_delete):
+    """
+    Delete specified directories and their contents.
+    Returns total space freed in MB.
+    """
+    space_freed = 0
+    logging.info("\nCleaning up local files...")
+
+    for dir_path in dirs_to_delete:
+        path = Path(dir_path)
+        if path.exists():
+            try:
+                if path.is_file():
+                    size = path.stat().st_size
+                    path.unlink()
+                    space_freed += size
+                else:
+                    # Calculate directory size before removal
+                    size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+                    shutil.rmtree(path)
+                    space_freed += size
+
+                logging.info(f"Deleted: {path} (freed {size / (1024 * 1024):.2f}MB)")
+            except Exception as e:
+                logging.error(f"Error deleting {path}: {e}")
+
+    return space_freed / (1024 * 1024)  # Convert to MB
 
 
 def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
@@ -22,7 +131,9 @@ def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical
     disk_usage = psutil.disk_usage(current_dir)
     available_mb = disk_usage.free / (1024 * 1024)
 
-    # Calculate thresholds based on quota percentage
+    # Log current usage
+    quota_used_pct = log_disk_usage(quota_mb)
+
     warning_mb = quota_mb * (warning_threshold_pct / 100)
     critical_mb = quota_mb * (critical_threshold_pct / 100)
 

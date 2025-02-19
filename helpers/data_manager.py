@@ -1,3 +1,4 @@
+import logging
 import threading
 from typing import Dict, Set
 import polars as pl
@@ -85,19 +86,26 @@ class DataManager:
         is_safe, is_abundant = check_critical_disk_space()
 
         if not is_safe:
-            print("\nCritical disk space reached. Initiating upload process...")
+            logging.warning("\nCritical disk space reached. Initiating upload process...")
             if self.upload_to_s3():
-                print("Successfully uploaded data to S3 and cleared local storage")
-                # Verify cleanup was successful
-                _, is_now_abundant = check_critical_disk_space()
-                if not is_now_abundant:
-                    print("Warning: Storage still low after upload")
+                # Clean up temporary files after successful upload
+                space_freed = cleanup_temp_files(self.base_dir)
+                logging.info(f"Cleaned up temporary files, freed {space_freed:.2f}MB")
+
+                # Verify storage status after cleanup
+                is_safe, is_abundant = check_critical_disk_space()
+                if not is_abundant:
+                    logging.warning("Storage still low after cleanup and upload")
                 return True
             else:
-                print("Failed to upload to S3. Local storage critical!")
+                logging.error("Failed to upload to S3. Local storage critical!")
                 return False
         elif not is_abundant:
-            print("\nWarning: Disk space is running low, consider manual intervention")
+            logging.warning("\nWarning: Disk space is running low")
+            # Try cleaning up temp files proactively
+            space_freed = cleanup_temp_files(self.base_dir)
+            if space_freed > 0:
+                logging.info(f"Proactively cleaned up temporary files, freed {space_freed:.2f}MB")
 
         return True
 
