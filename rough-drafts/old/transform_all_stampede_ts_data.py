@@ -19,20 +19,26 @@ import pandas as pd
 from helpers.data_version_manager import DataVersionManager
 
 
-def check_critical_disk_space(warning_gb=50, critical_gb=20):
+def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
     """
-    Check disk space status
+    Check disk space status based on quota and thresholds
     Returns:
         - (True, True) if space is fine
         - (True, False) if warning level reached
         - (False, False) if critical level reached
     """
-    disk_usage = psutil.disk_usage('C:')
-    available_gb = disk_usage.free / (1024 ** 3)
+    # Use current directory instead of hardcoded drive
+    current_dir = os.path.abspath(os.curdir)
+    disk_usage = psutil.disk_usage(current_dir)
+    available_mb = disk_usage.free / (1024 * 1024)  # Convert to MB
+
+    # Calculate thresholds based on quota percentage
+    warning_mb = quota_mb * (warning_threshold_pct / 100)
+    critical_mb = quota_mb * (critical_threshold_pct / 100)
 
     return (
-        available_gb > critical_gb,  # is_safe
-        available_gb > warning_gb  # is_abundant
+        available_mb > critical_mb,  # is_safe
+        available_mb > warning_mb  # is_abundant
     )
 
 
@@ -41,20 +47,16 @@ def save_monthly_data_locally(monthly_data, base_dir, version_manager):
     Save monthly data to local files, updating existing files if they exist
     Returns list of saved file paths
     """
-    output_dir = os.path.join(base_dir, "monthly_data")
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    output_dir = Path(base_dir) / "monthly_data"
+    output_dir.mkdir(exist_ok=True)
 
     version_suffix = version_manager.get_current_version()
     saved_files = []
 
     for month, new_df in monthly_data.items():
-        file_path = os.path.join(
-            output_dir,
-            f"FRESCO_Stampede_ts_{month}_{version_suffix}.csv"
-        )
+        file_path = output_dir / f"FRESCO_Stampede_ts_{month}_{version_suffix}.csv"
 
-        if os.path.exists(file_path):
+        if file_path.exists():
             # Read existing file and merge with new data
             existing_df = pd.read_csv(file_path)
             merged_df = pd.concat([existing_df, new_df]).drop_duplicates()
@@ -63,7 +65,7 @@ def save_monthly_data_locally(monthly_data, base_dir, version_manager):
             # Create new file
             new_df.to_csv(file_path, index=False)
 
-        saved_files.append(file_path)
+        saved_files.append(str(file_path))
 
     return saved_files
 
@@ -183,14 +185,15 @@ class ProcessingTracker:
 
 
 # Safety Check Functions
-def check_disk_space(required_space_gb=10):
+def check_disk_space(required_space_mb=10240):  # Default 10GB in MB
     """
-    Check if there's enough disk space available
+    Check if there's enough disk space available in current directory
     Returns True if enough space, False otherwise
     """
-    disk_usage = psutil.disk_usage('C:')
-    available_gb = disk_usage.free / (1024 ** 3)  # Convert to GB
-    return available_gb > required_space_gb
+    current_dir = os.path.abspath(os.curdir)
+    disk_usage = psutil.disk_usage(current_dir)
+    available_mb = disk_usage.free / (1024 * 1024)  # Convert to MB
+    return available_mb > required_space_mb
 
 
 # Directory and File Management Functions
@@ -603,15 +606,8 @@ def check_memory_usage(threshold_percent=90):
 
 
 def get_base_dir():
-    """Get the current working directory using pwd"""
-    try:
-        result = subprocess.run(['pwd'], capture_output=True, text=True)
-        base_dir = result.stdout.strip()
-        return base_dir
-    except Exception as e:
-        print(f"Error getting base directory: {str(e)}")
-        print(f"Using: {os.getcwd()}")
-        return os.getcwd()  # Fallback to os.getcwd()
+    """Get the base directory in a platform-agnostic way"""
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def main():
