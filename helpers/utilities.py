@@ -2,6 +2,7 @@ import gc
 import os
 import shutil
 import time
+from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
 import psutil
@@ -9,23 +10,49 @@ import requests
 from bs4 import BeautifulSoup
 
 
-def check_critical_disk_space(warning_gb=50, critical_gb=20):
+def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
     """
-    Check disk space status for the current directory
+    Check disk space status based on quota and thresholds
     Returns:
         - (True, True) if space is fine
         - (True, False) if warning level reached
         - (False, False) if critical level reached
     """
-    # Get the directory where the script is running
     current_dir = os.path.abspath(os.curdir)
     disk_usage = psutil.disk_usage(current_dir)
-    available_gb = disk_usage.free / (1024 ** 3)
+    available_mb = disk_usage.free / (1024 * 1024)
+
+    # Calculate thresholds based on quota percentage
+    warning_mb = quota_mb * (warning_threshold_pct / 100)
+    critical_mb = quota_mb * (critical_threshold_pct / 100)
 
     return (
-        available_gb > critical_gb,  # is_safe
-        available_gb > warning_gb  # is_abundant
+        available_mb > critical_mb,  # is_safe
+        available_mb > warning_mb  # is_abundant
     )
+
+
+def cleanup_after_upload(base_dir: str, version: str):
+    """
+    Clean up local files after successful S3 upload
+    Returns True if cleanup was successful
+    """
+    try:
+        # Clean up monthly data files
+        save_dir = Path(base_dir) / "monthly_data"
+        if save_dir.exists():
+            pattern = f"FRESCO_Stampede_ts_*_{version}.csv"
+            for file in save_dir.glob(pattern):
+                file.unlink()
+
+            # Remove directory if empty
+            if not any(save_dir.iterdir()):
+                save_dir.rmdir()
+
+        return True
+    except Exception as e:
+        print(f"Error during post-upload cleanup: {e}")
+        return False
 
 
 def get_base_dir():

@@ -1,3 +1,4 @@
+import gc
 import os
 import queue
 import signal
@@ -59,26 +60,35 @@ class DataProcessor:
                 self.tracker.update_node_status(node_name, NodeStatus.PROCESSING)
                 folder_path = os.path.join(self.base_dir, node_name)
 
-                # Use process pool for CPU-intensive operations
-                result = process_node_folder(folder_path, self.process_pool)
+                try:
+                    result = process_node_folder(folder_path, self.process_pool)
 
-                if result is not None:
-                    # Use polars for efficient datetime operations
-                    df_split = result.with_columns([
-                        pl.col("Timestamp").dt.strftime("%Y_%m").alias("month")
-                    ])
+                    if result is not None:
+                        # Use polars for efficient datetime operations
+                        df_split = result.with_columns([
+                            pl.col("Timestamp").dt.strftime("%Y_%m").alias("month")
+                        ])
 
-                    # Group by month using polars
-                    batch_monthly = {}
-                    for month in df_split.get_column("month").unique():
-                        month_data = df_split.filter(pl.col("month") == month)
-                        batch_monthly[month] = month_data.drop("month")
+                        # Group by month using polars
+                        batch_monthly = {}
+                        for month in df_split.get_column("month").unique():
+                            month_data = df_split.filter(pl.col("month") == month)
+                            batch_monthly[month] = month_data.drop("month")
 
-                    self.data_manager.update_monthly_data(batch_monthly)
-                    self.tracker.update_node_status(node_name, NodeStatus.COMPLETED)
-                    cleanup_files([folder_path])
-                else:
-                    self.tracker.update_node_status(node_name, NodeStatus.FAILED)
+                        self.data_manager.update_monthly_data(batch_monthly)
+                        self.tracker.update_node_status(node_name, NodeStatus.COMPLETED)
+
+                        # Immediately clean up after successful processing
+                        cleanup_files([folder_path])
+
+                        # Force garbage collection
+                        gc.collect()
+                    else:
+                        self.tracker.update_node_status(node_name, NodeStatus.FAILED)
+                finally:
+                    # Clean up the folder even if processing fails
+                    if os.path.exists(folder_path):
+                        cleanup_files([folder_path])
 
                 self.process_queue.task_done()
             except queue.Empty:
@@ -166,23 +176,31 @@ class DataProcessor:
     def _main_loop(self):
         """Main loop for queuing downloads"""
         start_index = self.tracker.current_batch * 3
-        while True:
-            is_safe, _ = check_critical_disk_space()
-            if not is_safe:
-                print("Critical disk space reached. Saving checkpoint...")
+
+        while not self.stop_event.is_set():
+            try:
+                # Check storage and potentially trigger upload
+                if not self.data_manager.manage_storage():
+                    print("Storage management failed. Saving checkpoint and stopping...")
+                    self.data_manager.save_checkpoint()
+                    break
+
+                next_index, has_more = self._queue_next_batch(start_index)
+                if next_index is None or not has_more:
+                    print("No more nodes to process")
+                    break
+
+                start_index = next_index
+                self.tracker.current_batch += 1
+                self.tracker.save_status()
+
+                # Small delay between batches
+                time.sleep(1)
+
+            except Exception as e:
+                print(f"Error in main loop: {e}")
                 self.data_manager.save_checkpoint()
                 break
-
-            next_index, has_more = self._queue_next_batch(start_index)
-            if next_index is None or not has_more:
-                break
-
-            start_index = next_index
-            self.tracker.current_batch += 1
-            self.tracker.save_status()
-
-            # Small delay between batches
-            time.sleep(1)
 
     def _queue_next_batch(self, start_index):
         """Queue the next batch of nodes for downloading"""
@@ -201,12 +219,13 @@ class DataProcessor:
             if start_index >= len(node_links):
                 return None, False
 
-            current_batch = node_links[start_index:start_index + 3]
+            # Reduced batch size from 3 to 1
+            current_batch = node_links[start_index:start_index + 1]
             for link in current_batch:
                 node_url = urljoin(base_url, link['href'])
                 self.download_queue.put((link, node_url))
 
-            return start_index + 3, start_index + 3 < len(node_links)
+            return start_index + 1, start_index + 1 < len(node_links)
         except Exception as e:
             print(f"Error queuing batch: {e}")
             return None, False
