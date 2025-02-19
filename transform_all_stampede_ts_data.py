@@ -18,7 +18,8 @@ import psutil
 from typing import Dict
 import pandas as pd
 from helpers.data_version_manager import DataVersionManager
-from helpers.utilities import log_disk_usage, cleanup_temp_files, setup_quota_logging
+from helpers.utilities import log_disk_usage, cleanup_temp_files, setup_quota_logging, check_disk_space, \
+    check_critical_disk_space
 
 
 def save_monthly_data_locally(monthly_data, base_dir, version_manager):
@@ -161,92 +162,6 @@ class ProcessingTracker:
         """Get list of nodes that haven't been processed yet"""
         return [node for node in available_nodes
                 if node not in self.status['processed_nodes']]
-
-
-# Safety Check Functions
-def check_disk_space(required_space_mb=1024):
-    """
-    Check if there's enough disk space available
-    Returns True if enough space, False otherwise
-    """
-    try:
-        # Get disk usage for the current directory
-        disk_usage = psutil.disk_usage(os.getcwd())
-
-        # Convert bytes to MB
-        available_mb = disk_usage.free / (1024 * 1024)
-
-        logging.info(f"Available disk space: {available_mb:.2f}MB")
-        return available_mb > required_space_mb
-
-    except Exception as e:
-        logging.error(f"Error checking disk space: {e}")
-        return False
-
-
-def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=90):
-    """
-    Check disk space status
-    Returns:
-        - (True, True) if space is fine
-        - (True, False) if warning level reached
-        - (False, False) if critical level reached
-    """
-    try:
-        # Get disk usage for the current directory
-        disk_usage = psutil.disk_usage(os.getcwd())
-
-        # Calculate percentage used
-        percent_used = disk_usage.percent
-
-        # Log current disk usage
-        free_gb = disk_usage.free / (1024 ** 3)  # Convert to GB
-        total_gb = disk_usage.total / (1024 ** 3)
-        logging.info(f"Disk Usage - Free: {free_gb:.2f}GB, Total: {total_gb:.2f}GB, Used: {percent_used:.1f}%")
-
-        return (
-            percent_used < critical_threshold_pct,  # is_safe
-            percent_used < warning_threshold_pct  # is_abundant
-        )
-
-    except Exception as e:
-        logging.error(f"Error checking disk space: {e}")
-        return False, False
-
-
-def get_user_disk_usage():
-    """Get current user's disk usage using quota command"""
-    try:
-        result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            # Skip header lines and look for the data line
-            for line in lines[2:]:  # Skip the first two header lines
-                fields = line.split()
-                if len(fields) >= 4:  # Ensure we have enough fields
-                    # Fields should be: [Filesystem, blocks, quota, limit, grace]
-                    used = fields[1]
-                    quota = fields[2]
-                    limit = fields[3]
-
-                    # Convert values, handling different unit suffixes
-                    def parse_size(size_str):
-                        if size_str.endswith('K'):
-                            return float(size_str[:-1]) / 1024  # Convert KB to MB
-                        elif size_str.endswith('M'):
-                            return float(size_str[:-1])
-                        elif size_str.endswith('G'):
-                            return float(size_str[:-1]) * 1024  # Convert GB to MB
-                        else:
-                            return float(size_str) / 1024  # Assume KB if no suffix
-
-                    return parse_size(used), parse_size(quota), parse_size(limit)
-
-        logging.error("Could not parse quota output")
-        return None, None, None
-    except Exception as e:
-        logging.error(f"Error getting quota information: {e}")
-        return None, None, None
 
 
 # Directory and File Management Functions

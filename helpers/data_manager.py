@@ -83,10 +83,10 @@ class DataManager:
 
     def manage_storage(self):
         """Check storage and trigger S3 upload if needed"""
-        is_safe, is_abundant = check_critical_disk_space()
+        is_safe, is_abundant = check_critical_disk_space(warning_threshold_pct=70, critical_threshold_pct=80)
 
         if not is_safe:
-            logging.warning("\nCritical disk space reached. Initiating upload process...")
+            logging.warning("\nCritical quota usage reached. Initiating upload process...")
             if self.upload_to_s3():
                 # Clean up temporary files after successful upload
                 space_freed = cleanup_temp_files(self.base_dir)
@@ -95,13 +95,13 @@ class DataManager:
                 # Verify storage status after cleanup
                 is_safe, is_abundant = check_critical_disk_space()
                 if not is_abundant:
-                    logging.warning("Storage still low after cleanup and upload")
+                    logging.warning("Quota usage still high after cleanup and upload")
                 return True
             else:
                 logging.error("Failed to upload to S3. Local storage critical!")
                 return False
         elif not is_abundant:
-            logging.warning("\nWarning: Disk space is running low")
+            logging.warning("\nWarning: Quota usage is running high")
             # Try cleaning up temp files proactively
             space_freed = cleanup_temp_files(self.base_dir)
             if space_freed > 0:

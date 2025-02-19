@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
-import psutil
 import requests
 from bs4 import BeautifulSoup
 
@@ -35,68 +34,69 @@ def get_user_disk_usage():
         result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
         if result.returncode == 0:
             lines = result.stdout.strip().split('\n')
-            for line in lines:
-                if '/dev/mapper/dyndatavg-home_a' in line:
-                    fields = [f for f in line.split() if f]
+            # Look for the data line (should be line 3, index 2)
+            if len(lines) >= 3:
+                # Split the line and get rid of empty strings
+                fields = [f for f in lines[2].split() if f]
+                if len(fields) >= 3:  # We need at least space, quota, and limit
+                    # Parse values, removing 'M' suffix if present
                     used_mb = float(fields[0].rstrip('M'))
                     quota_mb = float(fields[1].rstrip('M'))
                     limit_mb = float(fields[2].rstrip('M'))
                     return used_mb, quota_mb, limit_mb
+
+        logging.error(f"Unexpected quota output format: {result.stdout}")
         return None, None, None
     except Exception as e:
         logging.error(f"Error getting quota information: {e}")
         return None, None, None
 
 
-def log_disk_usage():
-    """Log current disk usage statistics"""
-    try:
-        disk_usage = psutil.disk_usage(os.getcwd())
-
-        # Convert to more readable units
-        used_gb = disk_usage.used / (1024 ** 3)
-        free_gb = disk_usage.free / (1024 ** 3)
-        total_gb = disk_usage.total / (1024 ** 3)
-        percent_used = disk_usage.percent
-
-        logging.info(
-            f"Disk Usage - Used: {used_gb:.2f}GB, "
-            f"Free: {free_gb:.2f}GB, "
-            f"Total: {total_gb:.2f}GB, "
-            f"Percent Used: {percent_used:.1f}%"
-        )
-
-        if percent_used > 85:
-            logging.warning(f"High disk usage: {percent_used:.1f}% of space used!")
-
-        return percent_used
-
-    except Exception as e:
-        logging.error(f"Error determining disk usage: {e}")
-        return None
-
-
 def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=90):
     """
-    Check disk space status based on quota and thresholds
+    Check disk space status based on user quota
     Returns:
         - (True, True) if space is fine
         - (True, False) if warning level reached
         - (False, False) if critical level reached
     """
-    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+    used_mb, quota_mb, _ = get_user_disk_usage()
 
     if used_mb is None or quota_mb is None:
-        logging.error("Could not check disk space - using conservative estimate")
+        logging.error("Could not determine quota usage")
         return False, False
 
-    quota_used_pct = (used_mb / quota_mb) * 100
-    log_disk_usage()
+    percent_used = (used_mb / quota_mb) * 100
+    logging.info(f"Quota Usage - Used: {used_mb:.2f}MB, Quota: {quota_mb:.2f}MB, Used: {percent_used:.1f}%")
 
     return (
-        quota_used_pct < critical_threshold_pct,  # is_safe
-        quota_used_pct < warning_threshold_pct  # is_abundant
+        percent_used < critical_threshold_pct,  # is_safe
+        percent_used < warning_threshold_pct  # is_abundant
     )
+
+
+def log_disk_usage():
+    """Log current disk usage statistics based on quota"""
+    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+
+    if used_mb is not None and quota_mb is not None:
+        percent_used = (used_mb / quota_mb) * 100
+        available_mb = quota_mb - used_mb
+
+        logging.info(
+            f"Quota Usage - Used: {used_mb:.2f}MB, "
+            f"Available: {available_mb:.2f}MB, "
+            f"Quota: {quota_mb:.2f}MB, "
+            f"Percent Used: {percent_used:.1f}%"
+        )
+
+        if percent_used > 85:
+            logging.warning(f"High quota usage: {percent_used:.1f}% of quota used!")
+
+        return percent_used
+    else:
+        logging.error("Could not determine quota usage")
+        return None
 
 
 def check_disk_space(required_space_mb=1024):
