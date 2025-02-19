@@ -12,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import boto3
+from botocore.exceptions import ClientError
 import concurrent.futures
 from dataclasses import dataclass, asdict
 import logging
@@ -492,7 +493,7 @@ class ETLPipeline:
 
                 self.download_queue.task_done()
 
-            except Queue.Empty:
+            except queue.Empty:
                 continue
             except Exception as e:
                 logging.error(f"Error in download worker: {e}")
