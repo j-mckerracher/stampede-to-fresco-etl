@@ -11,7 +11,8 @@ import polars as pl
 from helpers.data_manager import DataManager
 from helpers.node_status import NodeStatus
 from helpers.processing_tracker import ProcessingTracker
-from helpers.utilities import download_node_folder, process_node_folder, cleanup_files, cleanup_temp_files
+from helpers.utilities import download_node_folder, process_node_folder, cleanup_files, cleanup_temp_files, \
+    get_user_disk_usage
 
 
 class ParallelETL:
@@ -100,8 +101,12 @@ class ParallelETL:
 
     def _check_disk_usage(self):
         """Monitor disk usage and trigger upload if needed"""
-        used = self.data_manager._get_disk_usage()
-        if used > self.critical_threshold:
+        used_mb, quota_mb, _ = get_user_disk_usage()  # Use the function from utilities.py
+        if used_mb is None:
+            logging.error("Could not determine disk usage")
+            return
+
+        if used_mb > self.critical_threshold:
             logging.warning("Critical disk usage reached! Triggering upload...")
             if self.data_manager.upload_to_s3():
                 logging.info("Upload successful, incrementing version")
@@ -109,8 +114,7 @@ class ParallelETL:
             else:
                 logging.error("Upload failed! Trying to free space...")
                 self._emergency_cleanup()
-
-        elif used > self.warning_threshold:
+        elif used_mb > self.warning_threshold:
             logging.info("High disk usage warning - proactive cleanup")
             self._proactive_cleanup()
 
