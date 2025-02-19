@@ -34,25 +34,33 @@ def get_user_disk_usage():
         result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
         if result.returncode == 0:
             lines = result.stdout.strip().split('\n')
-            # Look for the data line (should be line 3, index 2)
-            if len(lines) >= 3:
-                # Split the line and get rid of empty strings
-                fields = [f for f in lines[2].split() if f]
-                if len(fields) >= 3:  # We need at least space, quota, and limit
-                    # Parse values, removing 'M' suffix if present
-                    used_mb = float(fields[0].rstrip('M'))
-                    quota_mb = float(fields[1].rstrip('M'))
-                    limit_mb = float(fields[2].rstrip('M'))
-                    return used_mb, quota_mb, limit_mb
 
-        logging.error(f"Unexpected quota output format: {result.stdout}")
-        return None, None, None
+            # Find the line with actual values (it's the line after /dev/mapper)
+            for i, line in enumerate(lines):
+                if '/dev/mapper/dyndatavg-home_a' in line:
+                    # The values are in the next line
+                    if i + 1 < len(lines):
+                        values_line = lines[i + 1].strip()
+                        fields = [f for f in values_line.split() if f]
+
+                        if len(fields) >= 3:
+                            # Parse values, removing 'M' suffix
+                            used_mb = float(fields[0].rstrip('M'))
+                            quota_mb = float(fields[1].rstrip('M'))
+                            limit_mb = float(fields[2].rstrip('M'))
+
+                            logging.debug(
+                                f"Parsed quota values: used={used_mb}MB, quota={quota_mb}MB, limit={limit_mb}MB")
+                            return used_mb, quota_mb, limit_mb
+
+            logging.error(f"Could not find quota values in output:\n{result.stdout}")
+            return None, None, None
     except Exception as e:
         logging.error(f"Error getting quota information: {e}")
         return None, None, None
 
 
-def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=90):
+def check_critical_disk_space(warning_threshold_pct=70, critical_threshold_pct=80):
     """
     Check disk space status based on user quota
     Returns:
@@ -63,11 +71,11 @@ def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=9
     used_mb, quota_mb, _ = get_user_disk_usage()
 
     if used_mb is None or quota_mb is None:
-        logging.error("Could not determine quota usage")
+        logging.error("Could not determine quota usage - assuming critical")
         return False, False
 
     percent_used = (used_mb / quota_mb) * 100
-    logging.info(f"Quota Usage - Used: {used_mb:.2f}MB, Quota: {quota_mb:.2f}MB, Used: {percent_used:.1f}%")
+    logging.info(f"Quota Usage - Used: {used_mb:.2f}MB ({percent_used:.1f}%) of {quota_mb:.2f}MB quota")
 
     return (
         percent_used < critical_threshold_pct,  # is_safe
@@ -108,6 +116,7 @@ def check_disk_space(required_space_mb=1024):
         return False
 
     available_mb = quota_mb - used_mb
+    logging.info(f"Space check - Available: {available_mb:.2f}MB, Required: {required_space_mb}MB")
     return available_mb > required_space_mb
 
 

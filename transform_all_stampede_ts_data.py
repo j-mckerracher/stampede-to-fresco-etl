@@ -19,7 +19,7 @@ from typing import Dict
 import pandas as pd
 from helpers.data_version_manager import DataVersionManager
 from helpers.utilities import log_disk_usage, cleanup_temp_files, setup_quota_logging, check_disk_space, \
-    check_critical_disk_space
+    check_critical_disk_space, get_user_disk_usage
 
 
 def save_monthly_data_locally(monthly_data, base_dir, version_manager):
@@ -739,7 +739,23 @@ def test_data_processing():
     return "Test completed successfully"
 
 
+def test_quota_parsing():
+    """Test the quota parsing functionality"""
+    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+    if used_mb is not None:
+        print(f"\nQuota parsing test results:")
+        print(f"Used space: {used_mb:.2f}MB")
+        print(f"Quota: {quota_mb:.2f}MB")
+        print(f"Limit: {limit_mb:.2f}MB")
+        print(f"Usage percentage: {(used_mb/quota_mb*100):.1f}%")
+        print(f"Available space: {(quota_mb-used_mb):.2f}MB")
+        return True
+    return False
+
+# Add this to your main() function to test:
 if __name__ == "__main__":
-    main()
-# 2057 batches total
-# 6172 node folder
+    logging.info("Testing quota parsing...")
+    if not test_quota_parsing():
+        logging.error("Quota parsing test failed!")
+        sys.exit(1)
+    logging.info("Quota parsing test successful, proceeding with main execution...")
