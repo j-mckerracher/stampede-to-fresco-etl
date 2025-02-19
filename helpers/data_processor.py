@@ -23,9 +23,10 @@ from pathlib import Path
 
 
 class DataProcessor:
-    def __init__(self, base_dir: str, max_download_threads: int = 8, max_process_threads: int = None):
+    def __init__(self, base_dir: str, batch_size: int = 10, max_process_threads: int = None):
         self.base_dir = base_dir
-        self.max_download_threads = max_download_threads
+        self.batch_size = batch_size
+        self.max_download_threads = batch_size
         self.max_process_threads = max_process_threads or max(1, cpu_count() - 1)
         self.tracker = ProcessingTracker(base_dir)
         self.data_manager = DataManager(base_dir)
@@ -259,13 +260,12 @@ class DataProcessor:
 
     def _main_loop(self):
         """Main loop for queuing downloads and processing"""
-        batch_size = 10  # Process 10 nodes at a time
-
         # Calculate start_index based on processed nodes
         processed_count = len(self.tracker.node_status)
         start_index = processed_count
 
         logging.info(f"Resuming from index {start_index} (processed {processed_count} nodes)")
+        logging.info(f"Using batch size of {self.batch_size} with {self.max_download_threads} download threads")
 
         while not self.stop_event.is_set():
             try:
@@ -275,7 +275,7 @@ class DataProcessor:
                     self.data_manager.save_checkpoint()
                     break
 
-                next_index, has_more = self._queue_next_batch(start_index, batch_size)
+                next_index, has_more = self._queue_next_batch(start_index, self.batch_size)
                 if next_index is None or not has_more:
                     print("No more nodes to process")
                     break
