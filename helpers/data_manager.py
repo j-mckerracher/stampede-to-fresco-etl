@@ -6,7 +6,7 @@ from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
 from helpers.data_version_manager import DataVersionManager
-from helpers.utilities import check_critical_disk_space, cleanup_after_upload
+from helpers.utilities import check_critical_disk_space, cleanup_after_upload, cleanup_temp_files
 
 
 class DataManager:

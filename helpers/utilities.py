@@ -3,11 +3,11 @@ import logging
 import os
 import shutil
 import time
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
-import psutil
 import requests
 from bs4 import BeautifulSoup
 
@@ -16,7 +16,6 @@ def setup_quota_logging(base_dir: str):
     """Configure logging for disk quota monitoring"""
     log_dir = Path(base_dir) / "logs"
     log_dir.mkdir(exist_ok=True)
-
     log_file = log_dir / f"disk_usage_{datetime.now().strftime('%Y%m')}.log"
 
     logging.basicConfig(
@@ -29,25 +28,82 @@ def setup_quota_logging(base_dir: str):
     )
 
 
-def log_disk_usage(quota_mb=24512):
-    """Log current disk usage statistics"""
-    current_dir = os.path.abspath(os.curdir)
-    disk_usage = psutil.disk_usage(current_dir)
+def get_user_disk_usage():
+    """Get current user's disk usage using quota command"""
+    try:
+        result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
+        if result.returncode == 0:
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if '/dev/mapper/dyndatavg-home_a' in line:
+                    fields = [f for f in line.split() if f]
+                    used_mb = float(fields[0].rstrip('M'))
+                    quota_mb = float(fields[1].rstrip('M'))
+                    limit_mb = float(fields[2].rstrip('M'))
+                    return used_mb, quota_mb, limit_mb
+        return None, None, None
+    except Exception as e:
+        logging.error(f"Error getting quota information: {e}")
+        return None, None, None
 
-    used_mb = (disk_usage.total - disk_usage.free) / (1024 * 1024)
-    available_mb = disk_usage.free / (1024 * 1024)
+
+def log_disk_usage():
+    """Log current disk usage statistics based on quota command"""
+    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+
+    if used_mb is not None and quota_mb is not None:
+        quota_used_pct = (used_mb / quota_mb) * 100
+        available_mb = quota_mb - used_mb
+
+        logging.info(
+            f"Disk Usage - Used: {used_mb:.2f}MB, "
+            f"Available: {available_mb:.2f}MB, "
+            f"Quota: {quota_mb:.2f}MB, "
+            f"Quota Used: {quota_used_pct:.1f}%"
+        )
+
+        if quota_used_pct > 85:
+            logging.warning(f"High disk usage: {quota_used_pct:.1f}% of quota used!")
+
+        return quota_used_pct
+    else:
+        logging.error("Could not determine disk usage")
+        return None
+
+
+def check_critical_disk_space(warning_threshold_pct=80, critical_threshold_pct=90):
+    """
+    Check disk space status based on quota and thresholds
+    Returns:
+        - (True, True) if space is fine
+        - (True, False) if warning level reached
+        - (False, False) if critical level reached
+    """
+    used_mb, quota_mb, limit_mb = get_user_disk_usage()
+
+    if used_mb is None or quota_mb is None:
+        logging.error("Could not check disk space - using conservative estimate")
+        return False, False
+
     quota_used_pct = (used_mb / quota_mb) * 100
+    log_disk_usage()
 
-    logging.info(
-        f"Disk Usage - Used: {used_mb:.2f}MB, "
-        f"Available: {available_mb:.2f}MB, "
-        f"Quota Used: {quota_used_pct:.1f}%"
+    return (
+        quota_used_pct < critical_threshold_pct,  # is_safe
+        quota_used_pct < warning_threshold_pct  # is_abundant
     )
 
-    if quota_used_pct > 85:
-        logging.warning(f"High disk usage: {quota_used_pct:.1f}% of quota used!")
 
-    return quota_used_pct
+def check_disk_space(required_space_mb=1024):
+    """Check if there's enough disk space available based on quota"""
+    used_mb, quota_mb, _ = get_user_disk_usage()
+
+    if used_mb is None or quota_mb is None:
+        logging.error("Could not check available space - assuming insufficient space")
+        return False
+
+    available_mb = quota_mb - used_mb
+    return available_mb > required_space_mb
 
 
 def find_temp_files(base_dir: str, older_than_hours: int = 24) -> list:
@@ -91,10 +147,7 @@ def cleanup_temp_files(base_dir: str) -> int:
 
 
 def cleanup_files(dirs_to_delete):
-    """
-    Delete specified directories and their contents.
-    Returns total space freed in MB.
-    """
+    """Delete specified directories and their contents"""
     space_freed = 0
     logging.info("\nCleaning up local files...")
 
@@ -107,7 +160,6 @@ def cleanup_files(dirs_to_delete):
                     path.unlink()
                     space_freed += size
                 else:
-                    # Calculate directory size before removal
                     size = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
                     shutil.rmtree(path)
                     space_freed += size
@@ -119,37 +171,9 @@ def cleanup_files(dirs_to_delete):
     return space_freed / (1024 * 1024)  # Convert to MB
 
 
-def check_critical_disk_space(quota_mb=24512, warning_threshold_pct=30, critical_threshold_pct=15):
-    """
-    Check disk space status based on quota and thresholds
-    Returns:
-        - (True, True) if space is fine
-        - (True, False) if warning level reached
-        - (False, False) if critical level reached
-    """
-    current_dir = os.path.abspath(os.curdir)
-    disk_usage = psutil.disk_usage(current_dir)
-    available_mb = disk_usage.free / (1024 * 1024)
-
-    # Log current usage
-    quota_used_pct = log_disk_usage(quota_mb)
-
-    warning_mb = quota_mb * (warning_threshold_pct / 100)
-    critical_mb = quota_mb * (critical_threshold_pct / 100)
-
-    return (
-        available_mb > critical_mb,  # is_safe
-        available_mb > warning_mb  # is_abundant
-    )
-
-
 def cleanup_after_upload(base_dir: str, version: str):
-    """
-    Clean up local files after successful S3 upload
-    Returns True if cleanup was successful
-    """
+    """Clean up local files after successful S3 upload"""
     try:
-        # Clean up monthly data files
         save_dir = Path(base_dir) / "monthly_data"
         if save_dir.exists():
             pattern = f"FRESCO_Stampede_ts_*_{version}.csv"
@@ -162,7 +186,7 @@ def cleanup_after_upload(base_dir: str, version: str):
 
         return True
     except Exception as e:
-        print(f"Error during post-upload cleanup: {e}")
+        logging.error(f"Error during post-upload cleanup: {e}")
         return False
 
 
@@ -171,21 +195,9 @@ def get_base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def check_disk_space(required_space_gb=10):
-    """
-    Check if there's enough disk space available in current directory
-    Returns True if enough space, False otherwise
-    """
-    current_dir = os.path.abspath(os.curdir)
-    disk_usage = psutil.disk_usage(current_dir)
-    available_gb = disk_usage.free / (1024 ** 3)
-    return available_gb > required_space_gb
-
-
-# Directory and File Management Functions
 def create_directory(path):
-    if not os.path.exists(path):
-        os.makedirs(path)
+    """Create directory if it doesn't exist"""
+    Path(path).mkdir(exist_ok=True)
 
 
 def download_file(url, local_path, max_retries=3, retry_delay=5):
@@ -200,138 +212,27 @@ def download_file(url, local_path, max_retries=3, retry_delay=5):
             return True
 
         except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)}")
+            logging.error(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)}")
             if attempt < max_retries - 1:
                 time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
 
     return False
 
 
-def process_node_folder(folder_path, process_pool):
-    """Process a single node folder using multiprocessing"""
-    try:
-        # Prepare arguments for multiprocessing
-        file_types = ['block', 'cpu', 'nfs', 'mem']
-        args = [(folder_path, file_type) for file_type in file_types]
-
-        # Process files in parallel
-        results = []
-        for file_results in process_pool.imap_unordered(process_file_multiprocess, args):
-            if file_results:
-                results.extend(file_results)
-
-            # Clean up as we go
-            gc.collect()
-
-        if results:
-            # Concatenate results using Polars
-            final_result = pl.concat(results)
-            return final_result
-
-        return None
-    except Exception as e:
-        print(f"Error processing folder {folder_path}: {e}")
-        return None
-
-
-def process_file_multiprocess(args):
-    """Process a single file type in a multiprocessing worker"""
-    folder_path, file_type = args
-    file_path = os.path.join(folder_path, f'{file_type}.csv')
-    if not os.path.exists(file_path):
-        return None
-
-    if file_type == 'mem':
-        memused_df, memused_nocache_df = process_memory_metrics(file_path)
-        return [memused_df, memused_nocache_df]
-    else:
-        return [globals()[f'process_{file_type}_file'](file_path)]
-
-
-def process_memory_metrics(file_path):
-    """Process mem.csv file using Polars"""
-    df = pl.read_csv(file_path)
-
-    # Convert KB to bytes
-    memory_cols = ["MemTotal", "MemFree", "MemUsed", "FilePages"]
-    for col in memory_cols:
-        if col in df.columns:
-            df = df.with_columns([
-                (pl.col(col) * 1024).alias(col)
-            ])
-
-    # Calculate memory metrics
-    df = df.with_columns([
-        (pl.col("MemUsed") / (1024 * 1024 * 1024)).alias("memused"),
-        ((pl.col("MemUsed") - pl.col("FilePages")) / (1024 * 1024 * 1024))
-        .clip(0, None)
-        .alias("memused_minus_diskcache")
-    ])
-
-    # Format Job Id
-    df = df.with_columns([
-        pl.col("jobID").str.replace("job", "JOB", literal=True)
-        .str.replace("ID", "")
-        .alias("Job Id")
-    ])
-
-    # Create separate dataframes for each metric
-    memused_df = df.select([
-        "Job Id",
-        "node",
-        pl.lit("memused").alias("Event"),
-        pl.col("memused").alias("Value"),
-        pl.lit("GB").alias("Units"),
-        pl.col("timestamp").str.strptime(pl.Datetime).alias("Timestamp")
-    ])
-
-    memused_nocache_df = df.select([
-        "Job Id",
-        "node",
-        pl.lit("memused_minus_diskcache").alias("Event"),
-        pl.col("memused_minus_diskcache").alias("Value"),
-        pl.lit("GB").alias("Units"),
-        pl.col("timestamp").str.strptime(pl.Datetime).alias("Timestamp")
-    ])
-
-    return memused_df, memused_nocache_df
-
-
-def cleanup_files(dirs_to_delete):
-    """
-    Delete specified directories and their contents.
-    """
-    print("\nCleaning up local files...")
-    for dir_path in dirs_to_delete:
-        if os.path.exists(dir_path):
-            try:
-                if os.path.isfile(dir_path):
-                    os.remove(dir_path)
-                else:
-                    shutil.rmtree(dir_path)
-                print(f"Deleted: {dir_path}")
-            except Exception as e:
-                print(f"Error deleting {dir_path}: {str(e)}")
-
-
 def download_node_folder(node_info, save_dir, tracker):
-    """
-    Downloads only the required CSV files (block, cpu, nfs, mem) for a single node folder.
-    To be run in a separate thread.
-    """
+    """Downloads required CSV files for a single node folder"""
     link, node_url = node_info
     node_name = link.text.strip('/')
     required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
 
     try:
         if tracker.is_node_processed(node_name):
-            print(f"Node {node_name} already processed, skipping...")
+            logging.info(f"Node {node_name} already processed, skipping...")
             return
 
-        node_dir = os.path.join(save_dir, node_name)
+        node_dir = Path(save_dir) / node_name
         create_directory(node_dir)
 
-        # Get the CSV files in the NODE directory
         node_response = requests.get(node_url)
         node_soup = BeautifulSoup(node_response.text, 'html.parser')
 
@@ -341,29 +242,50 @@ def download_node_folder(node_info, save_dir, tracker):
         for csv_link in node_soup.find_all('a'):
             if csv_link.text in required_files:
                 csv_url = urljoin(node_url, csv_link['href'])
-                csv_path = os.path.join(node_dir, csv_link.text)
-                if not download_file(csv_url, csv_path):
+                csv_path = node_dir / csv_link.text
+                if not download_file(csv_url, str(csv_path)):
                     download_success = False
                     break
                 files_found += 1
-                time.sleep(0.5)  # Small delay between files
+                time.sleep(0.5)
 
         if download_success and files_found == len(required_files):
-            print(f"Completed downloading required files for {node_name}")
+            logging.info(f"Completed downloading required files for {node_name}")
             tracker.mark_node_processed(node_name)
         else:
-            print(f"Failed to download all required files for {node_name}")
+            logging.error(f"Failed to download all required files for {node_name}")
             tracker.mark_node_failed(node_name)
-            # Clean up partial downloads
-            if os.path.exists(node_dir):
+            if node_dir.exists():
                 shutil.rmtree(node_dir)
 
     except Exception as e:
-        print(f"Error downloading node folder {node_name}: {str(e)}")
+        logging.error(f"Error downloading node folder {node_name}: {str(e)}")
         tracker.mark_node_failed(node_name)
-        # Clean up in case of error
-        if os.path.exists(node_dir):
+        if Path(node_dir).exists():
             shutil.rmtree(node_dir)
+
+
+# File processing functions remain the same as they are different for each file type
+def process_node_folder(folder_path, process_pool):
+    """Process a single node folder using multiprocessing"""
+    try:
+        file_types = ['block', 'cpu', 'nfs', 'mem']
+        args = [(folder_path, file_type) for file_type in file_types]
+
+        results = []
+        for file_results in process_pool.imap_unordered(process_file_multiprocess, args):
+            if file_results:
+                results.extend(file_results)
+            gc.collect()
+
+        if results:
+            final_result = pl.concat(results)
+            return final_result
+
+        return None
+    except Exception as e:
+        logging.error(f"Error processing folder {folder_path}: {e}")
+        return None
 
 
 def process_block_file(file_path):
@@ -533,3 +455,17 @@ def process_nfs_file(file_path):
         pl.lit("MB/s").alias("Units"),
         "Timestamp"
     ])
+
+
+def process_file_multiprocess(args):
+    """Process a single file type in a multiprocessing worker"""
+    folder_path, file_type = args
+    file_path = os.path.join(folder_path, f'{file_type}.csv')
+    if not os.path.exists(file_path):
+        return None
+
+    if file_type == 'mem':
+        memused_df, memused_nocache_df = process_memory_metrics(file_path)
+        return [memused_df, memused_nocache_df]
+    else:
+        return [globals()[f'process_{file_type}_file'](file_path)]

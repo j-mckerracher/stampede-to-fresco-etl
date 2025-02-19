@@ -187,15 +187,41 @@ class ProcessingTracker:
 
 
 # Safety Check Functions
-def check_disk_space(required_space_mb=10240):  # Default 10GB in MB
+def check_disk_space(required_space_mb=1024):  # Default 1GB in MB
     """
-    Check if there's enough disk space available in current directory
+    Check if there's enough disk space available based on quota
     Returns True if enough space, False otherwise
     """
-    current_dir = os.path.abspath(os.curdir)
-    disk_usage = psutil.disk_usage(current_dir)
-    available_mb = disk_usage.free / (1024 * 1024)  # Convert to MB
+    used_mb, quota_mb, _ = get_user_disk_usage()
+
+    if used_mb is None or quota_mb is None:
+        logging.error("Could not check available space - assuming insufficient space")
+        return False
+
+    available_mb = quota_mb - used_mb
     return available_mb > required_space_mb
+
+
+def get_user_disk_usage():
+    """Get current user's disk usage using quota command"""
+    try:
+        # Run quota command and parse output
+        result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
+        if result.returncode == 0:
+            # Parse the output to get space used
+            lines = result.stdout.strip().split('\n')
+            for line in lines:
+                if '/dev/mapper/dyndatavg-home_a' in line:
+                    # Split by whitespace and get used space (removing 'M' suffix)
+                    fields = [f for f in line.split() if f]
+                    used_mb = float(fields[0].rstrip('M'))
+                    quota_mb = float(fields[1].rstrip('M'))
+                    limit_mb = float(fields[2].rstrip('M'))
+                    return used_mb, quota_mb, limit_mb
+        return None, None, None
+    except Exception as e:
+        logging.error(f"Error getting quota information: {e}")
+        return None, None, None
 
 
 # Directory and File Management Functions
