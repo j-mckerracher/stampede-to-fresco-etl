@@ -259,8 +259,13 @@ class DataProcessor:
 
     def _main_loop(self):
         """Main loop for queuing downloads and processing"""
-        start_index = self.tracker.current_batch * 3
         batch_size = 10  # Process 10 nodes at a time
+
+        # Calculate start_index based on processed nodes
+        processed_count = len(self.tracker.node_status)
+        start_index = processed_count
+
+        logging.info(f"Resuming from index {start_index} (processed {processed_count} nodes)")
 
         while not self.stop_event.is_set():
             try:
@@ -323,16 +328,26 @@ class DataProcessor:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
 
+            # Get all NODE links and sort them numerically
             node_links = [
                 link for link in soup.find_all('a')
                 if 'NODE' in link.text
                    and self.tracker.node_status.get(link.text.strip('/')) != NodeStatus.COMPLETED
             ]
 
+            # Sort nodes numerically
+            node_links.sort(key=lambda x: int(x.text.strip('/').replace('NODE', '')))
+
             if start_index >= len(node_links):
                 return None, False
 
+            logging.info(f"Queuing nodes starting at index {start_index}")
             current_batch = node_links[start_index:start_index + batch_size]
+
+            # Log the nodes being queued
+            node_names = [link.text.strip('/') for link in current_batch]
+            logging.info(f"Queuing nodes: {node_names}")
+
             for link in current_batch:
                 node_url = urljoin(base_url, link['href'])
                 self.download_queue.put((link, node_url))
