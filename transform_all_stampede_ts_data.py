@@ -205,19 +205,32 @@ def check_disk_space(required_space_mb=1024):  # Default 1GB in MB
 def get_user_disk_usage():
     """Get current user's disk usage using quota command"""
     try:
-        # Run quota command and parse output
         result = subprocess.run(['quota', '-s'], capture_output=True, text=True)
         if result.returncode == 0:
-            # Parse the output to get space used
             lines = result.stdout.strip().split('\n')
-            for line in lines:
-                if '/dev/mapper/dyndatavg-home_a' in line:
-                    # Split by whitespace and get used space (removing 'M' suffix)
-                    fields = [f for f in line.split() if f]
-                    used_mb = float(fields[0].rstrip('M'))
-                    quota_mb = float(fields[1].rstrip('M'))
-                    limit_mb = float(fields[2].rstrip('M'))
-                    return used_mb, quota_mb, limit_mb
+            # Skip header lines and look for the data line
+            for line in lines[2:]:  # Skip the first two header lines
+                fields = line.split()
+                if len(fields) >= 4:  # Ensure we have enough fields
+                    # Fields should be: [Filesystem, blocks, quota, limit, grace]
+                    used = fields[1]
+                    quota = fields[2]
+                    limit = fields[3]
+
+                    # Convert values, handling different unit suffixes
+                    def parse_size(size_str):
+                        if size_str.endswith('K'):
+                            return float(size_str[:-1]) / 1024  # Convert KB to MB
+                        elif size_str.endswith('M'):
+                            return float(size_str[:-1])
+                        elif size_str.endswith('G'):
+                            return float(size_str[:-1]) * 1024  # Convert GB to MB
+                        else:
+                            return float(size_str) / 1024  # Assume KB if no suffix
+
+                    return parse_size(used), parse_size(quota), parse_size(limit)
+
+        logging.error("Could not parse quota output")
         return None, None, None
     except Exception as e:
         logging.error(f"Error getting quota information: {e}")
