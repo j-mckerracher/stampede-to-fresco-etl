@@ -687,3 +687,4 @@ class ETLPipeline:
                 thread.join()
 
             logging.info("ETL pipeline completed")
+
