@@ -417,6 +417,7 @@ class ETLPipeline:
             max_download_workers: int = 3,
             max_process_workers: int = 4
     ):
+        self.base_url = base_url  # Store base_url as instance variable
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
 
@@ -504,6 +505,11 @@ class ETLPipeline:
         """Worker thread for processing node data"""
         while not self.should_stop.is_set():
             try:
+                # Add check for empty queue before getting item
+                if self.process_queue.empty() and not self.active_downloads:
+                    time.sleep(1)
+                    continue
+
                 node_name = self.process_queue.get(timeout=1)
 
                 with self._lock:
@@ -565,7 +571,7 @@ class ETLPipeline:
 
                 self.process_queue.task_done()
 
-            except Queue.Empty:
+            except queue.Empty:
                 continue
             except Exception as e:
                 logging.error(f"Error in process worker: {e}")
