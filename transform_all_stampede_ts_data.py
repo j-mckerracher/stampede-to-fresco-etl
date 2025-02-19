@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import sys
 import threading
 import os
 import numpy as np
@@ -747,15 +748,17 @@ def test_quota_parsing():
         print(f"Used space: {used_mb:.2f}MB")
         print(f"Quota: {quota_mb:.2f}MB")
         print(f"Limit: {limit_mb:.2f}MB")
-        print(f"Usage percentage: {(used_mb/quota_mb*100):.1f}%")
-        print(f"Available space: {(quota_mb-used_mb):.2f}MB")
+        print(f"Usage percentage: {(used_mb / quota_mb * 100):.1f}%")
+        print(f"Available space: {(quota_mb - used_mb):.2f}MB")
         return True
     return False
 
+
 # Add this to your main() function to test:
 if __name__ == "__main__":
-    logging.info("Testing quota parsing...")
-    if not test_quota_parsing():
-        logging.error("Quota parsing test failed!")
-        sys.exit(1)
-    logging.info("Quota parsing test successful, proceeding with main execution...")
+    main()
+    # logging.info("Testing quota parsing...")
+    # if not test_quota_parsing():
+    #     logging.error("Quota parsing test failed!")
+    #     sys.exit(1)
+    # logging.info("Quota parsing test successful, proceeding with main execution...")
