@@ -1,10 +1,10 @@
-import gc
 import logging
 import os
 import shutil
 import time
 import subprocess
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from urllib.parse import urljoin
 import polars as pl
@@ -145,6 +145,49 @@ def find_temp_files(base_dir: str, older_than_hours: int = 24) -> list:
     return old_files
 
 
+def process_folder_parallel(args):
+    """Process a single folder in parallel"""
+    folder_path, file_type = args
+    try:
+        file_path = os.path.join(folder_path, f'{file_type}.csv')
+        if not os.path.exists(file_path):
+            return None
+
+        if file_type == 'mem':
+            memused_df, memused_nocache_df = process_memory_metrics(file_path)
+            return [memused_df, memused_nocache_df]
+        else:
+            return [globals()[f'process_{file_type}_file'](file_path)]
+    except Exception as e:
+        logging.error(f"Error processing {folder_path}/{file_type}.csv: {e}")
+        return None
+
+
+def process_multiple_folders(folder_paths):
+    """Process multiple folders in parallel"""
+    try:
+        # Get number of CPU cores, leaving one free
+        num_cores = max(1, cpu_count() - 1)
+
+        # Create process pool
+        with Pool(processes=num_cores) as pool:
+            # Process folders in parallel
+            results = []
+            for result in pool.imap_unordered(process_node_folder, folder_paths):
+                if result is not None:
+                    results.append(result)
+
+            if results:
+                # Combine all results
+                final_result = pl.concat(results)
+                return final_result
+
+            return None
+    except Exception as e:
+        logging.error(f"Error in parallel processing: {e}")
+        return None
+
+
 def cleanup_temp_files(base_dir: str) -> int:
     """Clean up temporary files and return space freed in MB"""
     space_freed = 0
@@ -280,23 +323,30 @@ def download_node_folder(node_info, save_dir, tracker):
 
 
 # File processing functions remain the same as they are different for each file type
-def process_node_folder(folder_path, process_pool):
-    """Process a single node folder using multiprocessing"""
+def process_node_folder(folder_path):
+    """Process a node folder using parallel processing"""
     try:
-        file_types = ['block', 'cpu', 'nfs', 'mem']
-        args = [(folder_path, file_type) for file_type in file_types]
+        # Get number of CPU cores, leaving one free
+        num_cores = max(1, cpu_count() - 1)
 
-        results = []
-        for file_results in process_pool.imap_unordered(process_file_multiprocess, args):
-            if file_results:
-                results.extend(file_results)
-            gc.collect()
+        # Create process pool
+        with Pool(processes=num_cores) as pool:
+            # Prepare arguments for parallel processing
+            file_types = ['block', 'cpu', 'nfs', 'mem']
+            args = [(folder_path, file_type) for file_type in file_types]
 
-        if results:
-            final_result = pl.concat(results)
-            return final_result
+            # Process files in parallel
+            results = []
+            for file_results in pool.imap_unordered(process_folder_parallel, args):
+                if file_results:
+                    results.extend(file_results)
 
-        return None
+            if results:
+                # Combine all results
+                final_result = pl.concat(results)
+                return final_result
+
+            return None
     except Exception as e:
         logging.error(f"Error processing folder {folder_path}: {e}")
         return None

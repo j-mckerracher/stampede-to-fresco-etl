@@ -1,18 +1,25 @@
 import gc
-import os
+import glob
 import queue
+import shutil
 import signal
 import threading
 import time
-from multiprocessing import Pool, cpu_count
 from urllib.parse import urljoin
-import polars as pl
 import requests
 from bs4 import BeautifulSoup
 from helpers.data_manager import DataManager
 from helpers.node_status import NodeStatus
 from helpers.processing_tracker import ProcessingTracker
-from helpers.utilities import process_node_folder, cleanup_files, download_node_folder, check_critical_disk_space
+from helpers.utilities import (
+    process_node_folder, process_multiple_folders, cleanup_files,
+    download_node_folder
+)
+from multiprocessing import Pool, cpu_count
+import os
+import logging
+import polars as pl
+from pathlib import Path
 
 
 class DataProcessor:
@@ -22,6 +29,23 @@ class DataProcessor:
         self.max_process_threads = max_process_threads or max(1, cpu_count() - 1)
         self.tracker = ProcessingTracker(base_dir)
         self.data_manager = DataManager(base_dir)
+        self.process_pool = None
+
+        # Get nodes that were incomplete when the script last stopped
+        incomplete_nodes = self.tracker.get_incomplete_nodes()
+        if incomplete_nodes:
+            logging.info(f"Found {len(incomplete_nodes)} incomplete nodes from previous run")
+            logging.info(f"Incomplete nodes: {incomplete_nodes}")
+
+            # Clean up any data from these nodes to prevent duplication
+            self.data_manager.cleanup_incomplete_nodes(incomplete_nodes)
+
+            # Clean up any leftover folders from these nodes
+            for node in incomplete_nodes:
+                node_dir = Path(self.base_dir) / node
+                if node_dir.exists():
+                    logging.info(f"Cleaning up incomplete node directory: {node}")
+                    shutil.rmtree(node_dir)
 
         self.download_queue = queue.Queue()
         self.process_queue = queue.Queue()
@@ -36,6 +60,37 @@ class DataProcessor:
         """Handle shutdown signals"""
         print(f"\nReceived signal {signum}. Shutting down gracefully...")
         self.stop_event.set()
+
+        # Mark currently processing nodes as incomplete
+        current_nodes = set()
+
+        # Check download queue
+        while not self.download_queue.empty():
+            try:
+                item = self.download_queue.get_nowait()
+                if item is not None:
+                    link, _ = item
+                    node_name = link.text.strip('/')
+                    current_nodes.add(node_name)
+            except queue.Empty:
+                break
+
+        # Check process queue
+        while not self.process_queue.empty():
+            try:
+                node_name = self.process_queue.get_nowait()
+                if node_name is not None:
+                    current_nodes.add(node_name)
+            except queue.Empty:
+                break
+
+        # Update node statuses
+        for node in current_nodes:
+            self.tracker.update_node_status(node, NodeStatus.PROCESSING)
+
+        # Save current state
+        self.tracker.save_status()
+        self.data_manager.save_checkpoint()
 
         # Add None to queues to signal workers to stop
         for _ in range(self.max_download_threads):
@@ -126,7 +181,11 @@ class DataProcessor:
 
     def start(self):
         """Start processing with download-process pipeline"""
+        self.process_pool = None
         try:
+            # Initialize process pool
+            self.process_pool = Pool(processes=self.max_process_threads)
+
             # Start downloader threads
             download_threads = []
             for _ in range(self.max_download_threads):
@@ -146,36 +205,62 @@ class DataProcessor:
             try:
                 self._main_loop()
             except KeyboardInterrupt:
-                print("\nShutting down gracefully...")
+                print("\nReceived KeyboardInterrupt. Initiating graceful shutdown...")
+            except Exception as e:
+                print(f"\nError in main loop: {e}")
+                logging.error(f"Main loop error: {e}")
+            finally:
+                print("\nShutting down workers...")
                 self.stop_event.set()
 
-                # Add None to queues to signal workers to stop
+                # Signal workers to stop
                 for _ in range(self.max_download_threads):
                     self.download_queue.put(None)
                 for _ in range(self.max_process_threads):
                     self.process_queue.put(None)
 
-                # Wait for queues to empty
-                self.download_queue.join()
-                self.process_queue.join()
+                # Wait for queues to empty with timeout
+                try:
+                    self.download_queue.join()
+                    self.process_queue.join()
+                except Exception as e:
+                    print(f"Error waiting for queues to empty: {e}")
 
-                # Clean up process pool more gracefully
-                self.process_pool.close()
-                self.process_pool.terminate()
-                self.process_pool.join()
+                # Wait for threads to finish
+                for thread in download_threads + process_threads:
+                    try:
+                        thread.join(timeout=2.0)  # 2 second timeout for each thread
+                    except Exception as e:
+                        print(f"Error joining thread: {e}")
 
         except Exception as e:
-            print(f"Error in start: {e}")
+            print(f"Critical error in start: {e}")
+            logging.error(f"Critical error in start: {e}")
         finally:
-            # Ensure process pool is cleaned up
-            if hasattr(self, 'process_pool'):
-                self.process_pool.close()
-                self.process_pool.terminate()
-                self.process_pool.join()
+            print("\nCleaning up resources...")
+            # Save checkpoint before cleanup
+            try:
+                self.data_manager.save_checkpoint()
+            except Exception as e:
+                print(f"Error saving checkpoint: {e}")
+
+            # Clean up process pool
+            if self.process_pool:
+                try:
+                    self.process_pool.close()
+                    self.process_pool.terminate()
+                    self.process_pool.join(timeout=3.0)  # 3 second timeout for pool cleanup
+                except Exception as e:
+                    print(f"Error cleaning up process pool: {e}")
+                finally:
+                    self.process_pool = None
+
+            print("Shutdown complete.")
 
     def _main_loop(self):
-        """Main loop for queuing downloads"""
+        """Main loop for queuing downloads and processing"""
         start_index = self.tracker.current_batch * 3
+        batch_size = 10  # Process 10 nodes at a time
 
         while not self.stop_event.is_set():
             try:
@@ -185,10 +270,38 @@ class DataProcessor:
                     self.data_manager.save_checkpoint()
                     break
 
-                next_index, has_more = self._queue_next_batch(start_index)
+                next_index, has_more = self._queue_next_batch(start_index, batch_size)
                 if next_index is None or not has_more:
                     print("No more nodes to process")
                     break
+
+                # Wait for downloads to complete
+                self.download_queue.join()
+
+                # Get all downloaded folders
+                node_folders = glob.glob(os.path.join(self.base_dir, "NODE*"))
+                if node_folders:
+                    # Process multiple folders in parallel
+                    result = process_multiple_folders(node_folders)
+
+                    if result is not None:
+                        # Split by month and update data manager
+                        df_split = result.with_columns([
+                            pl.col("Timestamp").dt.strftime("%Y_%m").alias("month")
+                        ])
+
+                        # Group by month
+                        batch_monthly = {}
+                        for month in df_split.get_column("month").unique():
+                            month_data = df_split.filter(pl.col("month") == month)
+                            batch_monthly[month] = month_data.drop("month")
+
+                        # Update data manager
+                        self.data_manager.update_monthly_data(batch_monthly)
+
+                        # Clean up processed folders
+                        for folder in node_folders:
+                            cleanup_files([folder])
 
                 start_index = next_index
                 self.tracker.current_batch += 1
@@ -202,7 +315,7 @@ class DataProcessor:
                 self.data_manager.save_checkpoint()
                 break
 
-    def _queue_next_batch(self, start_index):
+    def _queue_next_batch(self, start_index, batch_size):
         """Queue the next batch of nodes for downloading"""
         try:
             base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/"
@@ -219,13 +332,12 @@ class DataProcessor:
             if start_index >= len(node_links):
                 return None, False
 
-            # Reduced batch size from 3 to 1
-            current_batch = node_links[start_index:start_index + 1]
+            current_batch = node_links[start_index:start_index + batch_size]
             for link in current_batch:
                 node_url = urljoin(base_url, link['href'])
                 self.download_queue.put((link, node_url))
 
-            return start_index + 1, start_index + 1 < len(node_links)
+            return start_index + batch_size, start_index + batch_size < len(node_links)
         except Exception as e:
             print(f"Error queuing batch: {e}")
             return None, False
