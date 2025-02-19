@@ -668,11 +668,8 @@ class ETLPipeline:
 
 def main():
     """Main entry point"""
-    base_dir = os.getenv('ETL_BASE_DIR', '/path/to/base/dir')
-    base_url = os.getenv(
-        'ETL_BASE_URL',
-        'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
-    )
+    base_dir = os.getenv('ETL_BASE_DIR')
+    base_url = 'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
     quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
     bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
 
