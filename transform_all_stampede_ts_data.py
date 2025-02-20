@@ -370,14 +370,16 @@ class NodeDownloader:
             base_url: str,
             save_dir: Path,
             quota_manager: DiskQuotaManager,
-            session: requests.Session,  # Add session parameter
+            session: requests.Session,
+            process_queue: Queue,
             max_workers: int = 3
     ):
         self.base_url = base_url
         self.save_dir = save_dir
         self.quota_manager = quota_manager
         self.max_workers = max_workers
-        self.session = session  # Use provided session
+        self.session = session
+        self.process_queue = process_queue
         logger.info(f"NodeDownloader initialized with base URL: {base_url}, save directory: {save_dir}")
 
     def download_node_files(self, node_name: str) -> bool:
@@ -414,6 +416,8 @@ class NodeDownloader:
                 logger.warning(f"Failed to download all files for node {node_name}")
             else:
                 logger.info(f"Successfully downloaded all files for node {node_name}")
+                self.process_queue.put(node_name)  # Add this line
+                logger.info(f"Added {node_name} to process queue")
 
             return success
 
@@ -474,13 +478,20 @@ class ETLPipeline:
         self.state_manager = ProcessingStateManager(base_dir)
         self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
 
-        self.downloader = NodeDownloader(base_url, self.base_dir, self.quota_manager, self.session,
-                                         max_download_workers)
-        self.processor = NodeDataProcessor()
-        self.s3_uploader = S3Uploader(bucket_name)
-
         self.download_queue = queue.Queue()
         self.process_queue = queue.Queue()
+
+        self.downloader = NodeDownloader(
+            base_url=base_url,
+            save_dir=self.base_dir,
+            quota_manager=self.quota_manager,
+            session=self.session,
+            process_queue=self.process_queue,
+            max_workers=max_download_workers
+        )
+
+        self.processor = NodeDataProcessor()
+        self.s3_uploader = S3Uploader(bucket_name)
 
         self.max_download_workers = max_download_workers
         self.max_process_workers = max_process_workers
