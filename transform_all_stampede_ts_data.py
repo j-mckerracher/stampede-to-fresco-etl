@@ -361,7 +361,7 @@ class NodeDataProcessor:
         memused_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('memused').alias('Event'),
             pl.col('memused').alias('Value'),
             pl.lit('GB').alias('Units')
@@ -370,7 +370,7 @@ class NodeDataProcessor:
         memused_nocache_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('memused_minus_diskcache').alias('Event'),
             pl.col('memused_minus_diskcache').alias('Value'),
             pl.lit('GB').alias('Units')
