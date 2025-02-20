@@ -282,7 +282,7 @@ class NodeDataProcessor:
             pl.lit('block').alias('Event'),
             pl.col('Value'),
             pl.lit('GB/s').alias('Units'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp')
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
         ])
 
     def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
@@ -309,7 +309,7 @@ class NodeDataProcessor:
             pl.lit('cpuuser').alias('Event'),
             pl.col('Value'),
             pl.lit('CPU %').alias('Units'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp')
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
         ])
 
     def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
@@ -318,7 +318,7 @@ class NodeDataProcessor:
 
         df = df.with_columns([
             ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp')
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
         ])
 
         # Calculate time differences
@@ -360,7 +360,7 @@ class NodeDataProcessor:
         memused_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, fmt="%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('memused').alias('Event'),
             pl.col('memused').alias('Value'),
             pl.lit('GB').alias('Units')
