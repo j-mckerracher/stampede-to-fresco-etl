@@ -492,6 +492,19 @@ class ETLPipeline:
 
         logging.info("ETL pipeline initialized")
 
+    def cleanup_failed_node(self, node_name: str):
+        """Remove all data for a failed node from monthly files"""
+        try:
+            monthly_files = list(self.monthly_data_manager.monthly_data_dir.glob('*.csv'))
+            for file_path in monthly_files:
+                df = pd.read_csv(file_path)
+                # Remove rows where Host matches the failed node
+                df = df[df['Host'] != node_name]
+                df.to_csv(file_path, index=False)
+            logger.info(f"Cleaned up data for failed node: {node_name}")
+        except Exception as e:
+            logger.error(f"Error cleaning up node {node_name}: {e}")
+
     def get_node_list(self) -> List[str]:
         retry_count = 0
         while retry_count < self.max_retries:
@@ -584,46 +597,98 @@ class ETLPipeline:
             except Exception as e:
                 logging.error(f"Error in process worker: {e}", exc_info=True)
 
+    def check_upload_needed(self) -> bool:
+        """Check if we should trigger an S3 upload based on data volume"""
+        try:
+            monthly_files = list(self.monthly_data_manager.monthly_data_dir.glob('*.csv'))
+            total_size_mb = sum(f.stat().st_size for f in monthly_files) / (1024 * 1024)
+
+            threshold_mb = 8192  # 8GB
+
+            logger.debug(f"Current monthly data size: {total_size_mb:.2f} MB")
+            return total_size_mb > threshold_mb
+        except Exception as e:
+            logger.error(f"Error checking upload status: {e}")
+            return False
+
+    def upload_to_s3(self) -> bool:
+        """Upload files to S3 and cleanup after successful upload"""
+        try:
+            monthly_files = list(self.monthly_data_manager.monthly_data_dir.glob('*.csv'))
+            if self.s3_uploader.upload_files(monthly_files):
+                # Increment version after successful upload
+                self.version_manager.increment_version()
+
+                # Clean up uploaded files to free space
+                for file_path in monthly_files:
+                    file_path.unlink()
+
+                # Release quota space
+                total_size_mb = sum(f.stat().st_size for f in monthly_files) / (1024 * 1024)
+                self.quota_manager.release_space(int(total_size_mb))
+
+                logger.info("Successfully uploaded and cleaned up files")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error in upload process: {e}")
+            return False
+
     def run(self):
         try:
             nodes = self.get_node_list()
             if not nodes:
-                logging.error("No nodes found. Exiting.")
+                logger.error("No nodes found. Exiting.")
                 return
-            incomplete_nodes = self.state_manager.get_incomplete_nodes()
 
-            download_threads = [threading.Thread(target=self.download_worker) for _ in range(self.max_download_workers)]
-            process_threads = [threading.Thread(target=self.process_worker) for _ in range(self.max_process_workers)]
+            # Get incomplete nodes and clean up their data
+            incomplete_nodes = self.state_manager.get_incomplete_nodes()
+            for node in incomplete_nodes:
+                self.cleanup_failed_node(node)
+                node_dir = self.base_dir / node
+                if node_dir.exists():
+                    shutil.rmtree(node_dir)
+
+            # Start worker threads
+            download_threads = [threading.Thread(target=self.download_worker)
+                                for _ in range(self.max_download_workers)]
+            process_threads = [threading.Thread(target=self.process_worker)
+                               for _ in range(self.max_process_workers)]
+
             for thread in download_threads + process_threads:
                 thread.start()
+
+            # Queue nodes for processing
             for node in nodes:
-                if node in incomplete_nodes:
-                    node_dir = self.base_dir / node
-                    if node_dir.exists():
-                        shutil.rmtree(node_dir)
-                self.download_queue.put(node)
-                logging.info(f"Added {node} to queue")
+                if node in incomplete_nodes or not self.state_manager.node_statuses.get(node, None):
+                    self.download_queue.put(node)
+                    logger.info(f"Added {node} to queue")
+
+            # Monitor processing and handle uploads
             while True:
-                if self.download_queue.empty() and self.process_queue.empty() and not self.active_downloads and not self.active_processing:
+                if (self.download_queue.empty() and self.process_queue.empty()
+                        and not self.active_downloads and not self.active_processing):
                     break
+
                 if self.check_upload_needed():
-                    logging.info("Upload threshold reached. Uploading...")
+                    logger.info("Upload threshold reached. Uploading...")
                     self.upload_to_s3()
+
                 time.sleep(10)
-            logging.info("Processing complete. Performing final S3 upload.")
+
+            # Final upload
+            logger.info("Processing complete. Performing final S3 upload.")
             self.upload_to_s3()
-        except KeyboardInterrupt:
-            logging.info("Shutdown signal received")
-            self.should_stop.set()
+
         except Exception as e:
-            logging.error(f"Unexpected error: {e}", exc_info=True)
+            logger.error(f"Unexpected error: {e}", exc_info=True)
             self.should_stop.set()
         finally:
             self.should_stop.set()
             for thread in download_threads + process_threads:
                 thread.join()
             self.session.close()
-            logging.info("ETL pipeline completed")
+            logger.info("ETL pipeline completed")
 
 
 def main():
