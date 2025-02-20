@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 import pandas as pd
 import numpy as np
-import psutil
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -32,34 +31,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-
-
-def get_optimal_workers():
-    cpu_count = multiprocessing.cpu_count()
-    memory_gb = psutil.virtual_memory().total / (1024 * 1024 * 1024)  # Convert to GB
-
-    # Calculate optimal workers based on available CPU cores and memory
-    # We leave some headroom for system processes
-    cpu_workers = max(1, cpu_count - 1)
-
-    # Assume each worker might need ~2GB RAM for processing large datasets
-    memory_workers = max(1, int(memory_gb / 2))
-
-    # Take the minimum of CPU and memory-based worker counts
-    return min(cpu_workers, memory_workers)
-
-
-def get_optimal_chunk_size():
-    # Get available memory in bytes
-    available_memory = psutil.virtual_memory().available
-
-    # Use 75% of available memory as a safe limit
-    safe_memory = int(available_memory * 0.75)
-
-    # Convert to MB for easier handling
-    chunk_size_mb = safe_memory / (1024 * 1024)
-
-    return max(1024, int(chunk_size_mb))  # Minimum 1GB chunks
 
 
 @dataclass
@@ -293,61 +264,13 @@ class S3Uploader:
 
 
 class NodeDataProcessor:
-    """Process node data files using Polars with optimized parallel processing"""
-    def __init__(self):
-        self.cpu_count = max(1, multiprocessing.cpu_count() - 1)
-
-    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
-        """Process CPU metrics file to calculate CPU utilization
-
-        Args:
-            file_path (Path): Path to the CPU metrics CSV file
-
-        Returns:
-            pl.DataFrame: Processed DataFrame with CPU metrics
-        """
-        logger.info(f"Processing CPU file: {file_path}")
-        df = pl.read_csv(file_path)
-
-        # Calculate CPU utilization
-        # CPU utilization = (user + nice + system) / (user + nice + system + idle + iowait + irq + softirq + steal)
-        df = df.with_columns([
-            pl.col(['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal'])
-            .cast(pl.Float64)
-        ])
-
-        df = df.with_columns([
-            # Calculate total CPU time
-            (pl.col('user') + pl.col('nice') + pl.col('system') +
-             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-             pl.col('softirq') + pl.col('steal')).alias('total_time'),
-
-            # Calculate used CPU time
-            (pl.col('user') + pl.col('nice') + pl.col('system')).alias('used_time')
-        ])
-
-        # Calculate CPU utilization percentage
-        df = df.with_columns([
-            pl.when(pl.col('total_time') > 0)
-            .then((pl.col('used_time') / pl.col('total_time') * 100))
-            .otherwise(0)
-            .alias('Value')
-        ])
-
-        return df.select([
-            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('cpu_utilization').alias('Event'),
-            pl.col('Value'),
-            pl.lit('%').alias('Units')
-        ])
+    """Process node data files using Polars"""
 
     def process_block_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing block file: {file_path}")
         df = pl.read_csv(file_path)
 
-        # Calculate throughput - cast columns individually
+        # Calculate throughput
         df = df.with_columns([
             pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
             pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
@@ -377,17 +300,71 @@ class NodeDataProcessor:
             pl.lit('GB/s').alias('Units')
         ])
 
+    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
+        logger.info(f"Processing CPU file: {file_path}")
+        df = pl.read_csv(file_path)
+
+        df = df.with_columns([
+            (pl.col('user') + pl.col('nice') + pl.col('system') +
+             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
+             pl.col('softirq')).alias('total_ticks')
+        ])
+
+        df = df.with_columns([
+            pl.when(pl.col('total_ticks') > 0)
+            .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
+            .otherwise(0)
+            .clip(0, 100)
+            .alias('Value')
+        ])
+
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.lit('cpuuser').alias('Event'),
+            pl.col('Value'),
+            pl.lit('CPU %').alias('Units')
+        ])
+
+    def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
+        logger.info(f"Processing NFS file: {file_path}")
+        df = pl.read_csv(file_path)
+
+        df = df.with_columns([
+            ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
+        ])
+
+        # Calculate time differences
+        df = df.with_columns([
+            pl.col('Timestamp').diff().cast(pl.Duration).dt.total_seconds().fill_null(600).alias('TimeDiff')
+        ])
+
+        df = df.with_columns([
+            (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
+        ])
+
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.lit('nfs').alias('Event'),
+            pl.col('Value'),
+            pl.lit('MB/s').alias('Units')
+        ])
+
     def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
-        # Use streaming for large files
-        df = pl.scan_csv(file_path)
+        df = pl.read_csv(file_path)
 
-        # Optimize memory column calculations
+        # Convert KB to bytes
         memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
         df = df.with_columns([
             pl.col(col).mul(1024) for col in memory_cols if col in df.columns
         ])
 
+        # Calculate metrics in GB
         df = df.with_columns([
             (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
             ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
@@ -395,32 +372,29 @@ class NodeDataProcessor:
             .alias('memused_minus_diskcache')
         ])
 
-        # Use common base for both metrics to avoid redundant computation
-        base_df = df.select([
+        memused_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
             pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.col('memused'),
-            pl.col('memused_minus_diskcache')
-        ]).collect(streaming=True)
+            pl.lit('memused').alias('Event'),
+            pl.col('memused').alias('Value'),
+            pl.lit('GB').alias('Units')
+        ])
 
-        return [
-            base_df.with_columns([
-                pl.lit('memused').alias('Event'),
-                pl.col('memused').alias('Value'),
-                pl.lit('GB').alias('Units')
-            ]).drop(['memused', 'memused_minus_diskcache']),
+        memused_nocache_df = df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.lit('memused_minus_diskcache').alias('Event'),
+            pl.col('memused_minus_diskcache').alias('Value'),
+            pl.lit('GB').alias('Units')
+        ])
 
-            base_df.with_columns([
-                pl.lit('memused_minus_diskcache').alias('Event'),
-                pl.col('memused_minus_diskcache').alias('Value'),
-                pl.lit('GB').alias('Units')
-            ]).drop(['memused', 'memused_minus_diskcache'])
-        ]
+        return [memused_df, memused_nocache_df]
 
 
 class NodeDownloader:
-    """Download node data with improved parallel processing and quota management"""
+    """Download node data with parallel processing"""
 
     def __init__(
             self,
@@ -434,90 +408,49 @@ class NodeDownloader:
         self.base_url = base_url
         self.save_dir = save_dir
         self.quota_manager = quota_manager
-        self.max_workers = max_workers
+        self.max_workers = max_workers or multiprocessing.cpu_count()
         self.session = session
         self.process_queue = process_queue
-        self.download_semaphore = threading.Semaphore(20)  # Limit concurrent downloads
         logger.info(f"NodeDownloader initialized with base URL: {base_url}, save directory: {save_dir}")
 
-    def _get_file_size(self, url: str) -> int:
-        """Pre-check file size before downloading"""
-        try:
-            with self.download_semaphore:
-                response = self.session.head(url, allow_redirects=True)
-                return int(response.headers.get('content-length', 0))
-        except Exception as e:
-            logger.error(f"Error getting file size for {url}: {e}")
-            return 0
-
-    def _check_quota_for_node(self, node_name: str) -> bool:
-        """Check if we have enough quota for all files of a node"""
-        required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
-        total_size_mb = 0
-
-        for file_name in required_files:
-            file_url = urljoin(self.base_url, f"{node_name}/{file_name}")
-            size_bytes = self._get_file_size(file_url)
-            total_size_mb += size_bytes / (1024 * 1024)
-
-        # Add 10% buffer
-        total_size_mb *= 1.1
-
-        return self.quota_manager.request_space(int(total_size_mb))
-
     def download_node_files(self, node_name: str) -> bool:
-        """Download all files for a node with improved error handling and quota management"""
         node_dir = self.save_dir / node_name
         node_dir.mkdir(exist_ok=True)
         logger.info(f"Starting download for node: {node_name}")
 
-        # Check quota before starting downloads
-        if not self._check_quota_for_node(node_name):
-            logger.warning(f"Insufficient quota for node {node_name}")
-            if node_dir.exists():
-                shutil.rmtree(node_dir)
-            return False
-
+        node_url = urljoin(self.base_url, f"{node_name}/")
         required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
-        download_success = True
 
         try:
+            response = self.session.get(node_url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            download_tasks = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                future_to_file = {
-                    executor.submit(
-                        self._download_file,
-                        urljoin(self.base_url, f"{node_name}/{file_name}"),
-                        node_dir / file_name
-                    ): file_name
-                    for file_name in required_files
-                }
-
-                for future in concurrent.futures.as_completed(future_to_file):
-                    file_name = future_to_file[future]
-                    try:
-                        success = future.result()
-                        if not success:
-                            download_success = False
-                            break
-                    except Exception as e:
-                        logger.error(f"Error downloading {file_name} for {node_name}: {e}")
-                        download_success = False
-                        break
-
-            if not download_success and node_dir.exists():
-                shutil.rmtree(node_dir)
-                # Release quota for failed download
                 for file_name in required_files:
+                    file_url = urljoin(node_url, file_name)
                     file_path = node_dir / file_name
-                    if file_path.exists():
-                        self.quota_manager.release_space(
-                            file_path.stat().st_size / (1024 * 1024)
+
+                    download_tasks.append(
+                        executor.submit(
+                            self._download_file,
+                            file_url,
+                            file_path
                         )
+                    )
+
+                success = all(task.result() for task in download_tasks)
+
+            if not success:
+                shutil.rmtree(node_dir)
+                logger.warning(f"Failed to download all files for node {node_name}")
             else:
-                self.process_queue.put(node_name)
+                logger.info(f"Successfully downloaded all files for node {node_name}")
+                self.process_queue.put(node_name)  # Add this line
                 logger.info(f"Added {node_name} to process queue")
 
-            return download_success
+            return success
 
         except Exception as e:
             logger.error(f"Error downloading {node_name}: {e}")
@@ -526,28 +459,32 @@ class NodeDownloader:
             return False
 
     def _download_file(self, url: str, file_path: Path) -> bool:
-        """Download a single file with improved error handling"""
         try:
-            with self.download_semaphore:
-                logger.info(f"Downloading file: {url}")
-                response = self.session.get(url, stream=True)
-                response.raise_for_status()
+            logger.info(f"Downloading file: {url}")
+            response = self.session.get(url, stream=True)
+            response.raise_for_status()
 
-                temp_path = file_path.with_suffix('.tmp')
-                with open(temp_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
+            # Get file size and request quota
+            file_size = int(response.headers.get('content-length', 0))
+            if not self.quota_manager.request_space(file_size // (1024 * 1024) + 1):
+                logger.warning(f"Insufficient space to download {url}")
+                return False
 
-                # Atomic rename
-                temp_path.rename(file_path)
-                logger.info(f"Successfully downloaded {url} to {file_path}")
-                return True
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            logger.info(f"Successfully downloaded {url} to {file_path}")
+            return True
 
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}")
-            if temp_path.exists():
-                temp_path.unlink()
             return False
+        finally:
+            # Release quota space if download failed
+            if not file_path.exists():
+                self.quota_manager.release_space(file_size // (1024 * 1024) + 1)
+                logger.info(f"Released quota space for failed download: {url}")
 
 
 class ETLPipeline:
@@ -560,31 +497,21 @@ class ETLPipeline:
         self.base_dir.mkdir(exist_ok=True)
         self.max_retries = max_retries
 
-        # Initialize queues with size limits FIRST
-        self.download_queue = Queue(maxsize=max_download_workers * 2)
-        self.process_queue = Queue(maxsize=max_process_workers * 2)
-
-        # Initialize session with optimized connection pool
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=max_download_workers * 4,
-            pool_maxsize=max_download_workers * 4,
-            max_retries=max_retries,
-            pool_block=True
+            pool_connections=20, pool_maxsize=20, max_retries=max_retries, pool_block=False
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
 
-        # Initialize managers with strict quota
-        self.quota_manager = DiskQuotaManager(quota_mb, safety_buffer_mb=1024)
+        self.quota_manager = DiskQuotaManager(quota_mb)
         self.version_manager = VersionManager(base_dir)
         self.state_manager = ProcessingStateManager(base_dir)
         self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
 
-        # Initialize processor
-        self.processor = NodeDataProcessor()
+        self.download_queue = queue.Queue()
+        self.process_queue = queue.Queue()
 
-        # Initialize downloader (now process_queue exists)
         self.downloader = NodeDownloader(
             base_url=base_url,
             save_dir=self.base_dir,
@@ -594,54 +521,36 @@ class ETLPipeline:
             max_workers=max_download_workers
         )
 
-        # Initialize S3 uploader
-        self.s3_uploader = S3Uploader(bucket_name, max_retries=max_retries)
+        self.processor = NodeDataProcessor()
+        self.s3_uploader = S3Uploader(bucket_name)
 
         self.max_download_workers = max_download_workers
         self.max_process_workers = max_process_workers
-
-        # Event for graceful shutdown
         self.should_stop = threading.Event()
 
-        # Track active operations
         self.active_downloads = set()
         self.active_processing = set()
         self._lock = threading.Lock()
 
+        logging.info("ETL pipeline initialized")
+
     def cleanup_failed_node(self, node_name: str):
-        """Remove all data for a failed node to ensure data integrity"""
+        """Remove all data for a failed node from monthly files"""
         try:
-            # Get list of all monthly files
             monthly_files = list(self.monthly_data_manager.monthly_data_dir.glob('*.csv'))
-
             for file_path in monthly_files:
-                temp_path = file_path.with_suffix('.tmp')
-
-                # Read existing data
                 df = pl.read_csv(file_path)
-
-                # Remove rows for failed node
-                df_filtered = df.filter(pl.col('Host') != node_name)
-
-                # Write to temporary file first
-                df_filtered.write_csv(temp_path)
-
-                # Atomic rename
-                temp_path.rename(file_path)
-
+                # Remove rows where Host matches the failed node
+                df = df.filter(pl.col('Host') != node_name)
+                df.write_csv(file_path)
             logger.info(f"Cleaned up data for failed node: {node_name}")
-
-            # Clean up node directory if it exists
-            node_dir = self.base_dir / node_name
-            if node_dir.exists():
-                shutil.rmtree(node_dir)
-
         except Exception as e:
             logger.error(f"Error cleaning up node {node_name}: {e}")
 
     def process_worker(self):
         while not self.should_stop.is_set():
             try:
+                logger.info(f"Process worker waiting for node...")
                 node_name = self.process_queue.get(timeout=1)
                 with self._lock:
                     self.active_processing.add(node_name)
@@ -810,104 +719,77 @@ class ETLPipeline:
             return False
 
     def run(self):
-        download_threads = []  # Initialize before try block
-        process_threads = []  # Initialize before try block
-
         try:
-            # Get node list
             nodes = self.get_node_list()
             if not nodes:
                 logger.error("No nodes found. Exiting.")
                 return
 
-            # Clean up incomplete nodes from previous run
+            # Get incomplete nodes and clean up their data
             incomplete_nodes = self.state_manager.get_incomplete_nodes()
             for node in incomplete_nodes:
-                logger.info(f"Cleaning up incomplete node: {node}")
                 self.cleanup_failed_node(node)
+                node_dir = self.base_dir / node
+                if node_dir.exists():
+                    shutil.rmtree(node_dir)
 
             # Start worker threads
-            download_threads = [
-                threading.Thread(target=self.download_worker)
-                for _ in range(self.max_download_workers)
-            ]
-            process_threads = [
-                threading.Thread(target=self.process_worker)
-                for _ in range(self.max_process_workers)
-            ]
+            download_threads = [threading.Thread(target=self.download_worker)
+                                for _ in range(self.max_download_workers)]
+            process_threads = [threading.Thread(target=self.process_worker)
+                               for _ in range(self.max_process_workers)]
 
             for thread in download_threads + process_threads:
-                thread.daemon = True
                 thread.start()
 
             # Queue nodes for processing
             for node in nodes:
                 if node in incomplete_nodes or not self.state_manager.node_statuses.get(node, None):
                     self.download_queue.put(node)
-                    logger.info(f"Queued {node} for processing")
+                    logger.info(f"Added {node} to queue")
 
             # Monitor processing and handle uploads
-            upload_check_interval = 300  # 5 minutes
-            last_upload_check = time.time()
-
             while True:
-                if (self.download_queue.empty() and
-                        self.process_queue.empty() and
-                        not self.active_downloads and
-                        not self.active_processing):
+                if (self.download_queue.empty() and self.process_queue.empty()
+                        and not self.active_downloads and not self.active_processing):
                     break
 
-                current_time = time.time()
-                if current_time - last_upload_check > upload_check_interval:
-                    if self.check_upload_needed():
-                        logger.info("Upload threshold reached. Starting upload...")
-                        if self.upload_to_s3():
-                            self.version_manager.increment_version()
-                    last_upload_check = current_time
+                if self.check_upload_needed():
+                    logger.info("Upload threshold reached. Uploading...")
+                    self.upload_to_s3()
 
                 time.sleep(10)
 
-            # Final upload and version increment
-            logger.info("Processing complete. Performing final upload...")
-            if self.upload_to_s3():
-                self.version_manager.increment_version()
+            # Final upload
+            logger.info("Processing complete. Performing final S3 upload.")
+            self.upload_to_s3()
 
         except Exception as e:
-            logger.error(f"Pipeline error: {e}", exc_info=True)
+            logger.error(f"Unexpected error: {e}", exc_info=True)
             self.should_stop.set()
         finally:
             self.should_stop.set()
             for thread in download_threads + process_threads:
-                thread.join(timeout=60)
+                thread.join()
             self.session.close()
             logger.info("ETL pipeline completed")
 
 
 def main():
-    optimal_workers = get_optimal_workers()
-    chunk_size = get_optimal_chunk_size()
-
-    # Get total system memory in MB
-    total_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
-    # Use 80% of total memory for quota
-    quota_mb = int(total_memory_mb * 0.8)
-
-    base_dir = os.getenv('ETL_BASE_DIR', '/tmp/etl_data')
+    """Main entry point"""
+    base_dir = os.getenv('ETL_BASE_DIR', '/tmp/etl_data')  # Provides default value
     base_url = 'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
+    quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
     bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
 
     pipeline = ETLPipeline(
+        max_process_workers=12,
         base_url=base_url,
         base_dir=base_dir,
-        quota_mb=24512,  # 24GB quota
-        bucket_name=bucket_name,
-        max_download_workers=4,
-        max_process_workers=12
+        quota_mb=quota_mb,
+        bucket_name=bucket_name
     )
 
-    pl.Config.set_streaming_chunk_size(chunk_size)
-
-    # Use ThreadPool for IO-bound operations
     pipeline.run()
 
 
