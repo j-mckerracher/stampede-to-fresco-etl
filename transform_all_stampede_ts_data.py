@@ -258,11 +258,11 @@ class NodeDataProcessor:
 
         # Calculate throughput
         df = df.with_columns([
-            pl.col('rd_sectors').alias('rd_sectors_num'),
-            pl.col('wr_sectors').alias('wr_sectors_num'),
-            pl.col('rd_ticks').alias('rd_ticks_num'),
-            pl.col('wr_ticks').alias('wr_ticks_num')
-        ].cast(pl.Float64))
+            pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
+            pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
+            pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
+            pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
+        ])
 
         df = df.with_columns([
             (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
