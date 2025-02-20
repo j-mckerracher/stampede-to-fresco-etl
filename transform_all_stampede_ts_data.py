@@ -508,18 +508,19 @@ class ETLPipeline:
     """Main ETL pipeline implementation"""
 
     def __init__(self, base_url: str, base_dir: str, quota_mb: int, bucket_name: str,
-                 max_download_workers: int = 3, max_process_workers: int = 4):
+                 max_download_workers: int = 3, max_process_workers: int = 4, max_retries: int = 3):
         self.base_url = base_url
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
+        self.max_retries = max_retries  # Added missing attribute
 
         # Initialize session with optimized connection pool
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=max_download_workers * 4,  # Increased pool size
+            pool_connections=max_download_workers * 4,
             pool_maxsize=max_download_workers * 4,
-            max_retries=3,
-            pool_block=True  # Block instead of discarding
+            max_retries=max_retries,
+            pool_block=True
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
@@ -529,6 +530,22 @@ class ETLPipeline:
         self.version_manager = VersionManager(base_dir)
         self.state_manager = ProcessingStateManager(base_dir)
         self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
+
+        # Initialize processor
+        self.processor = NodeDataProcessor()  # Added missing processor initialization
+
+        # Initialize downloader
+        self.downloader = NodeDownloader(  # Added missing downloader initialization
+            base_url=base_url,
+            save_dir=self.base_dir,
+            quota_manager=self.quota_manager,
+            session=self.session,
+            process_queue=self.process_queue,
+            max_workers=max_download_workers
+        )
+
+        # Initialize S3 uploader
+        self.s3_uploader = S3Uploader(bucket_name, max_retries=max_retries)
 
         # Initialize queues with size limits
         self.download_queue = Queue(maxsize=max_download_workers * 2)
@@ -747,6 +764,9 @@ class ETLPipeline:
             return False
 
     def run(self):
+        download_threads = []  # Initialize before try block
+        process_threads = []  # Initialize before try block
+
         try:
             # Get node list
             nodes = self.get_node_list()
@@ -771,7 +791,7 @@ class ETLPipeline:
             ]
 
             for thread in download_threads + process_threads:
-                thread.daemon = True  # Allow clean shutdown
+                thread.daemon = True
                 thread.start()
 
             # Queue nodes for processing
@@ -785,14 +805,12 @@ class ETLPipeline:
             last_upload_check = time.time()
 
             while True:
-                # Check if all work is complete
                 if (self.download_queue.empty() and
-                    self.process_queue.empty() and
-                    not self.active_downloads and
-                    not self.active_processing):
+                        self.process_queue.empty() and
+                        not self.active_downloads and
+                        not self.active_processing):
                     break
 
-                # Periodic upload check
                 current_time = time.time()
                 if current_time - last_upload_check > upload_check_interval:
                     if self.check_upload_needed():
