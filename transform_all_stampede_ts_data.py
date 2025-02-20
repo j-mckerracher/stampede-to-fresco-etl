@@ -544,7 +544,7 @@ class ETLPipeline:
                 if success:
                     self.state_manager.update_node_status(node_name, download_complete=True)
                     self.process_queue.put(node_name)
-                    logging.info(f"Download complete: {node_name}")
+                    logging.info(f"Download complete: {node_name}, added to process queue")
                 else:
                     self.state_manager.update_node_status(node_name, download_complete=False)
                     logging.warning(f"Download failed: {node_name}")
@@ -560,6 +560,7 @@ class ETLPipeline:
     def process_worker(self):
         while not self.should_stop.is_set():
             try:
+                logger.info(f"Process worker waiting for node...")
                 node_name = self.process_queue.get(timeout=1)
                 with self._lock:
                     self.active_processing.add(node_name)
