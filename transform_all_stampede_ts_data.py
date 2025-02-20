@@ -569,15 +569,18 @@ class ETLPipeline:
                     # Process memory file
                     mem_path = node_dir / 'mem.csv'
                     if mem_path.exists():
-                        memused_df, memused_nocache_df = self.processor.process_memory_metrics(mem_path)
-                        dfs.extend([memused_df, memused_nocache_df])
+                        memory_dfs = self.processor.process_memory_metrics(mem_path)
+                        dfs.extend(memory_dfs)
 
                     if dfs:
                         combined_df = pl.concat(dfs)
-                        # Group by month
+
+                        # Group by month using Polars syntax
                         monthly_data = {}
-                        for group in combined_df.partition_by('Timestamp', as_dict=True):
-                            month_key = group['Timestamp'][0].strftime('%Y-%m')
+                        for group in combined_df.partition_by(
+                                pl.col('Timestamp').dt.strftime('%Y-%m')
+                        ):
+                            month_key = group['Timestamp'][0].dt.strftime('%Y-%m')
                             monthly_data[month_key] = group
 
                         self.monthly_data_manager.save_monthly_data(monthly_data)
