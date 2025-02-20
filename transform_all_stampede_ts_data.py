@@ -560,42 +560,83 @@ class ETLPipeline:
     def process_worker(self):
         while not self.should_stop.is_set():
             try:
-                if self.process_queue.empty() and not self.active_downloads:
-                    time.sleep(1)
-                    continue
                 node_name = self.process_queue.get(timeout=1)
                 with self._lock:
                     self.active_processing.add(node_name)
-                logging.info(f"Processing node {node_name}")
+                logger.info(f"Processing node {node_name}")
 
                 node_dir = self.base_dir / node_name
                 if not node_dir.exists():
-                    logging.warning(f"Node directory missing: {node_name}")
+                    logger.warning(f"Node directory missing: {node_name}")
                     continue
 
                 try:
-                    results = []
-                    for file_type in ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']:
-                        file_path = node_dir / file_type
-                        if file_path.exists():
-                            results.append(self.processor.process_file(file_path))
-                    if results:
-                        combined_df = pd.concat(results, ignore_index=True)
-                        monthly_data = self._split_by_month(combined_df)
-                        self.monthly_data_manager.save_monthly_data(monthly_data)
-                    self.state_manager.update_node_status(node_name, processing_complete=True)
+                    # Process each file type
+                    dfs = []
+
+                    # Process block file
+                    block_path = node_dir / 'block.csv'
+                    if block_path.exists():
+                        dfs.append(self.processor.process_block_file(block_path))
+
+                    # Process CPU file
+                    cpu_path = node_dir / 'cpu.csv'
+                    if cpu_path.exists():
+                        dfs.append(self.processor.process_cpu_file(cpu_path))
+
+                    # Process NFS file
+                    nfs_path = node_dir / 'nfs.csv'
+                    if nfs_path.exists():
+                        dfs.append(self.processor.process_nfs_file(nfs_path))
+
+                    # Process memory file
+                    mem_path = node_dir / 'mem.csv'
+                    if mem_path.exists():
+                        memused_df, memused_nocache_df = self.processor.process_memory_metrics(mem_path)
+                        dfs.extend([memused_df, memused_nocache_df])
+
+                    if dfs:
+                        combined_df = pd.concat(dfs, ignore_index=True)
+                        # Group by month
+                        monthly_data = {}
+                        for _, row in combined_df.iterrows():
+                            month_key = row['Timestamp'].strftime('%Y-%m')
+                            if month_key not in monthly_data:
+                                monthly_data[month_key] = []
+                            monthly_data[month_key].append(row)
+
+                        # Convert lists to DataFrames
+                        monthly_dfs = {
+                            month: pd.DataFrame(rows)
+                            for month, rows in monthly_data.items()
+                        }
+
+                        self.monthly_data_manager.save_monthly_data(monthly_dfs)
+
+                    self.state_manager.update_node_status(
+                        node_name,
+                        processing_complete=True,
+                        processing_started=False
+                    )
                     shutil.rmtree(node_dir)
-                    logging.info(f"Processing complete: {node_name}")
+                    logger.info(f"Processing complete: {node_name}")
+
                 except Exception as e:
-                    logging.error(f"Error processing {node_name}: {e}", exc_info=True)
-                    self.state_manager.update_node_status(node_name, processing_complete=False)
+                    logger.error(f"Error processing {node_name}: {e}", exc_info=True)
+                    self.state_manager.update_node_status(
+                        node_name,
+                        processing_complete=False,
+                        processing_started=False
+                    )
+
                 with self._lock:
                     self.active_processing.remove(node_name)
                 self.process_queue.task_done()
+
             except queue.Empty:
                 continue
             except Exception as e:
-                logging.error(f"Error in process worker: {e}", exc_info=True)
+                logger.error(f"Error in process worker: {e}", exc_info=True)
 
     def check_upload_needed(self) -> bool:
         """Check if we should trigger an S3 upload based on data volume"""
