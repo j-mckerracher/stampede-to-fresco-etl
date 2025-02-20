@@ -297,6 +297,52 @@ class NodeDataProcessor:
     def __init__(self):
         self.cpu_count = max(1, multiprocessing.cpu_count() - 1)
 
+    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
+        """Process CPU metrics file to calculate CPU utilization
+
+        Args:
+            file_path (Path): Path to the CPU metrics CSV file
+
+        Returns:
+            pl.DataFrame: Processed DataFrame with CPU metrics
+        """
+        logger.info(f"Processing CPU file: {file_path}")
+        df = pl.read_csv(file_path)
+
+        # Calculate CPU utilization
+        # CPU utilization = (user + nice + system) / (user + nice + system + idle + iowait + irq + softirq + steal)
+        df = df.with_columns([
+            pl.col(['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq', 'steal'])
+            .cast(pl.Float64)
+        ])
+
+        df = df.with_columns([
+            # Calculate total CPU time
+            (pl.col('user') + pl.col('nice') + pl.col('system') +
+             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
+             pl.col('softirq') + pl.col('steal')).alias('total_time'),
+
+            # Calculate used CPU time
+            (pl.col('user') + pl.col('nice') + pl.col('system')).alias('used_time')
+        ])
+
+        # Calculate CPU utilization percentage
+        df = df.with_columns([
+            pl.when(pl.col('total_time') > 0)
+            .then((pl.col('used_time') / pl.col('total_time') * 100))
+            .otherwise(0)
+            .alias('Value')
+        ])
+
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+            pl.lit('cpu_utilization').alias('Event'),
+            pl.col('Value'),
+            pl.lit('%').alias('Units')
+        ])
+
     def process_block_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing block file: {file_path}")
         df = pl.read_csv(file_path)
