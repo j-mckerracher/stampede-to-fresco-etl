@@ -512,7 +512,11 @@ class ETLPipeline:
         self.base_url = base_url
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
-        self.max_retries = max_retries  # Added missing attribute
+        self.max_retries = max_retries
+
+        # Initialize queues with size limits FIRST
+        self.download_queue = Queue(maxsize=max_download_workers * 2)
+        self.process_queue = Queue(maxsize=max_process_workers * 2)
 
         # Initialize session with optimized connection pool
         self.session = requests.Session()
@@ -532,10 +536,10 @@ class ETLPipeline:
         self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
 
         # Initialize processor
-        self.processor = NodeDataProcessor()  # Added missing processor initialization
+        self.processor = NodeDataProcessor()
 
-        # Initialize downloader
-        self.downloader = NodeDownloader(  # Added missing downloader initialization
+        # Initialize downloader (now process_queue exists)
+        self.downloader = NodeDownloader(
             base_url=base_url,
             save_dir=self.base_dir,
             quota_manager=self.quota_manager,
@@ -546,10 +550,6 @@ class ETLPipeline:
 
         # Initialize S3 uploader
         self.s3_uploader = S3Uploader(bucket_name, max_retries=max_retries)
-
-        # Initialize queues with size limits
-        self.download_queue = Queue(maxsize=max_download_workers * 2)
-        self.process_queue = Queue(maxsize=max_process_workers * 2)
 
         self.max_download_workers = max_download_workers
         self.max_process_workers = max_process_workers
