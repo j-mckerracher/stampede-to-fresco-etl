@@ -251,140 +251,131 @@ class S3Uploader:
 class NodeDataProcessor:
     """Process node data files using Polars"""
 
-    class NodeDataProcessor:
-        """Process node data files using Polars"""
+    def process_block_file(self, file_path: Path) -> pl.DataFrame:
+        logger.info(f"Processing block file: {file_path}")
+        df = pl.read_csv(file_path)
 
-        def process_block_file(self, file_path: Path) -> pl.DataFrame:
-            logger.info(f"Processing block file: {file_path}")
-            df = pl.read_csv(file_path)
+        # Calculate throughput
+        df = df.with_columns([
+            pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
+            pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
+            pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
+            pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
+        ])
 
-            # Calculate throughput
-            df = df.with_columns([
-                pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
-                pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
-                pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
-                pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
-            ])
+        df = df.with_columns([
+            (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
+            ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
+        ])
 
-            df = df.with_columns([
-                (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
-                ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
-            ])
+        # Convert to GB/s
+        df = df.with_columns([
+            pl.when(pl.col('total_ticks') > 0)
+            .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
+            .otherwise(0)
+            .alias('Value')
+        ])
 
-            # Convert to GB/s
-            df = df.with_columns([
-                pl.when(pl.col('total_ticks') > 0)
-                .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
-                .otherwise(0)
-                .alias('Value')
-            ])
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.lit('block').alias('Event'),
+            pl.col('Value'),
+            pl.lit('GB/s').alias('Units'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
+        ])
 
-            return df.select([
-                pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-                pl.col('node').alias('Host'),
-                pl.lit('block').alias('Event'),
-                pl.col('Value'),
-                pl.lit('GB/s').alias('Units'),
-                pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
-            ])
+    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
+        logger.info(f"Processing CPU file: {file_path}")
+        df = pl.read_csv(file_path)
 
-        def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
-            logger.info(f"Processing CPU file: {file_path}")
-            df = pl.read_csv(file_path)
+        df = df.with_columns([
+            (pl.col('user') + pl.col('nice') + pl.col('system') +
+             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
+             pl.col('softirq')).alias('total_ticks')
+        ])
 
-            df = df.with_columns([
-                (pl.col('user') + pl.col('nice') + pl.col('system') +
-                 pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-                 pl.col('softirq')).alias('total_ticks')
-            ])
+        df = df.with_columns([
+            pl.when(pl.col('total_ticks') > 0)
+            .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
+            .otherwise(0)
+            .clip(0, 100)
+            .alias('Value')
+        ])
 
-            df = df.with_columns([
-                pl.when(pl.col('total_ticks') > 0)
-                .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
-                .otherwise(0)
-                .clip(0, 100)
-                .alias('Value')
-            ])
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.lit('cpuuser').alias('Event'),
+            pl.col('Value'),
+            pl.lit('CPU %').alias('Units'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
+        ])
 
-            return df.select([
-                pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-                pl.col('node').alias('Host'),
-                pl.lit('cpuuser').alias('Event'),
-                pl.col('Value'),
-                pl.lit('CPU %').alias('Units'),
-                pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
-            ])
+    def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
+        logger.info(f"Processing NFS file: {file_path}")
+        df = pl.read_csv(file_path)
 
-        def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
-            logger.info(f"Processing NFS file: {file_path}")
-            df = pl.read_csv(file_path)
+        df = df.with_columns([
+            ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
+        ])
 
-            df = df.with_columns([
-                ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
-                pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
-            ])
+        # Calculate time differences
+        df = df.with_columns([
+            pl.col('Timestamp').diff().cast(pl.Duration).dt.seconds().fill_null(600).alias('TimeDiff')
+        ])
 
-            # Calculate time differences
-            df = df.with_columns([
-                pl.col('Timestamp').diff().cast(pl.Duration).dt.seconds().fill_null(600).alias('TimeDiff')
-            ])
+        df = df.with_columns([
+            (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
+        ])
 
-            df = df.with_columns([
-                (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
-            ])
+        return df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.lit('nfs').alias('Event'),
+            pl.col('Value'),
+            pl.lit('MB/s').alias('Units'),
+            pl.col('Timestamp')
+        ])
 
-            return df.select([
-                pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-                pl.col('node').alias('Host'),
-                pl.lit('nfs').alias('Event'),
-                pl.col('Value'),
-                pl.lit('MB/s').alias('Units'),
-                pl.col('Timestamp')
-            ])
+    def process_memory_metrics(self, file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
+        logger.info(f"Processing memory file: {file_path}")
+        df = pl.read_csv(file_path)
 
-        def process_memory_metrics(self, file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
-            logger.info(f"Processing memory file: {file_path}")
-            df = pl.read_csv(file_path)
+        # Convert KB to bytes
+        memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
+        df = df.with_columns([
+            pl.col(col).mul(1024) for col in memory_cols if col in df.columns
+        ])
 
-            # Convert KB to bytes
-            memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
-            df = df.with_columns([
-                pl.col(col).mul(1024) for col in memory_cols if col in df.columns
-            ])
+        # Calculate metrics in GB
+        df = df.with_columns([
+            (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
+            ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
+            .clip(0, None)
+            .alias('memused_minus_diskcache')
+        ])
 
-            # Calculate metrics in GB
-            df = df.with_columns([
-                (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
-                ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
-                .clip(0, None)
-                .alias('memused_minus_diskcache')
-            ])
+        memused_df = df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp'),
+            pl.lit('memused').alias('Event'),
+            pl.col('memused').alias('Value'),
+            pl.lit('GB').alias('Units')
+        ])
 
-            base_data = {
-                'Job Id': df['jobID'].str.replace_all('job', 'JOB', literal=True),
-                'Host': df['node'],
-                'Timestamp': pl.col('timestamp').str.strptime(pl.Datetime)
-            }
+        memused_nocache_df = df.select([
+            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
+            pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp'),
+            pl.lit('memused_minus_diskcache').alias('Event'),
+            pl.col('memused_minus_diskcache').alias('Value'),
+            pl.lit('GB').alias('Units')
+        ])
 
-            memused_df = df.select([
-                pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-                pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp'),
-                pl.lit('memused').alias('Event'),
-                pl.col('memused').alias('Value'),
-                pl.lit('GB').alias('Units')
-            ])
-
-            memused_nocache_df = df.select([
-                pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-                pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp'),
-                pl.lit('memused_minus_diskcache').alias('Event'),
-                pl.col('memused_minus_diskcache').alias('Value'),
-                pl.lit('GB').alias('Units')
-            ])
-
-            return memused_df, memused_nocache_df
+        return memused_df, memused_nocache_df
 
 
 class NodeDownloader:
