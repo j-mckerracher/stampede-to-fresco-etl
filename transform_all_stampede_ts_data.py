@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 import pandas as pd
 import numpy as np
+import psutil
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -31,6 +32,34 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def get_optimal_workers():
+    cpu_count = multiprocessing.cpu_count()
+    memory_gb = psutil.virtual_memory().total / (1024 * 1024 * 1024)  # Convert to GB
+
+    # Calculate optimal workers based on available CPU cores and memory
+    # We leave some headroom for system processes
+    cpu_workers = max(1, cpu_count - 1)
+
+    # Assume each worker might need ~2GB RAM for processing large datasets
+    memory_workers = max(1, int(memory_gb / 2))
+
+    # Take the minimum of CPU and memory-based worker counts
+    return min(cpu_workers, memory_workers)
+
+
+def get_optimal_chunk_size():
+    # Get available memory in bytes
+    available_memory = psutil.virtual_memory().available
+
+    # Use 75% of available memory as a safe limit
+    safe_memory = int(available_memory * 0.75)
+
+    # Convert to MB for easier handling
+    chunk_size_mb = safe_memory / (1024 * 1024)
+
+    return max(1024, int(chunk_size_mb))  # Minimum 1GB chunks
 
 
 @dataclass
@@ -264,18 +293,21 @@ class S3Uploader:
 
 
 class NodeDataProcessor:
-    """Process node data files using Polars"""
+    """Process node data files using Polars with optimized parallel processing"""
+
+    def __init__(self):
+        self.cpu_count = max(1, multiprocessing.cpu_count() - 1)
 
     def process_block_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing block file: {file_path}")
-        df = pl.read_csv(file_path)
+        # Use streaming for large files
+        df = pl.scan_csv(file_path)
 
-        # Calculate throughput
+        # Optimize calculations using lazy evaluation
         df = df.with_columns([
-            pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
-            pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
-            pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
-            pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
+            pl.col(['rd_sectors', 'wr_sectors', 'rd_ticks', 'wr_ticks'])
+            .cast(pl.Float64)
+            .suffix('_num')
         ])
 
         df = df.with_columns([
@@ -283,7 +315,7 @@ class NodeDataProcessor:
             ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
         ])
 
-        # Convert to GB/s
+        # Use lazy evaluation for better performance
         df = df.with_columns([
             pl.when(pl.col('total_ticks') > 0)
             .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
@@ -298,73 +330,19 @@ class NodeDataProcessor:
             pl.lit('block').alias('Event'),
             pl.col('Value'),
             pl.lit('GB/s').alias('Units')
-        ])
-
-    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
-        logger.info(f"Processing CPU file: {file_path}")
-        df = pl.read_csv(file_path)
-
-        df = df.with_columns([
-            (pl.col('user') + pl.col('nice') + pl.col('system') +
-             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-             pl.col('softirq')).alias('total_ticks')
-        ])
-
-        df = df.with_columns([
-            pl.when(pl.col('total_ticks') > 0)
-            .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
-            .otherwise(0)
-            .clip(0, 100)
-            .alias('Value')
-        ])
-
-        return df.select([
-            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('cpuuser').alias('Event'),
-            pl.col('Value'),
-            pl.lit('CPU %').alias('Units')
-        ])
-
-    def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
-        logger.info(f"Processing NFS file: {file_path}")
-        df = pl.read_csv(file_path)
-
-        df = df.with_columns([
-            ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
-        ])
-
-        # Calculate time differences
-        df = df.with_columns([
-            pl.col('Timestamp').diff().cast(pl.Duration).dt.total_seconds().fill_null(600).alias('TimeDiff')
-        ])
-
-        df = df.with_columns([
-            (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
-        ])
-
-        return df.select([
-            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('nfs').alias('Event'),
-            pl.col('Value'),
-            pl.lit('MB/s').alias('Units')
-        ])
+        ]).collect(streaming=True)
 
     def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
-        df = pl.read_csv(file_path)
+        # Use streaming for large files
+        df = pl.scan_csv(file_path)
 
-        # Convert KB to bytes
+        # Optimize memory column calculations
         memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
         df = df.with_columns([
             pl.col(col).mul(1024) for col in memory_cols if col in df.columns
         ])
 
-        # Calculate metrics in GB
         df = df.with_columns([
             (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
             ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
@@ -372,25 +350,28 @@ class NodeDataProcessor:
             .alias('memused_minus_diskcache')
         ])
 
-        memused_df = df.select([
+        # Use common base for both metrics to avoid redundant computation
+        base_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
             pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('memused').alias('Event'),
-            pl.col('memused').alias('Value'),
-            pl.lit('GB').alias('Units')
-        ])
+            pl.col('memused'),
+            pl.col('memused_minus_diskcache')
+        ]).collect(streaming=True)
 
-        memused_nocache_df = df.select([
-            pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
-            pl.col('node').alias('Host'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-            pl.lit('memused_minus_diskcache').alias('Event'),
-            pl.col('memused_minus_diskcache').alias('Value'),
-            pl.lit('GB').alias('Units')
-        ])
+        return [
+            base_df.with_columns([
+                pl.lit('memused').alias('Event'),
+                pl.col('memused').alias('Value'),
+                pl.lit('GB').alias('Units')
+            ]).drop(['memused', 'memused_minus_diskcache']),
 
-        return [memused_df, memused_nocache_df]
+            base_df.with_columns([
+                pl.lit('memused_minus_diskcache').alias('Event'),
+                pl.col('memused_minus_diskcache').alias('Value'),
+                pl.lit('GB').alias('Units')
+            ]).drop(['memused', 'memused_minus_diskcache'])
+        ]
 
 
 class NodeDownloader:
@@ -550,7 +531,6 @@ class ETLPipeline:
     def process_worker(self):
         while not self.should_stop.is_set():
             try:
-                logger.info(f"Process worker waiting for node...")
                 node_name = self.process_queue.get(timeout=1)
                 with self._lock:
                     self.active_processing.add(node_name)
@@ -776,21 +756,32 @@ class ETLPipeline:
 
 
 def main():
-    """Main entry point"""
-    base_dir = os.getenv('ETL_BASE_DIR', '/tmp/etl_data')  # Provides default value
+    optimal_workers = get_optimal_workers()
+    chunk_size = get_optimal_chunk_size()
+
+    # Get total system memory in MB
+    total_memory_mb = psutil.virtual_memory().total / (1024 * 1024)
+    # Use 80% of total memory for quota
+    quota_mb = int(total_memory_mb * 0.8)
+
+    base_dir = os.getenv('ETL_BASE_DIR', '/tmp/etl_data')
     base_url = 'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
-    quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
     bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
 
     pipeline = ETLPipeline(
         base_url=base_url,
         base_dir=base_dir,
         quota_mb=quota_mb,
-        bucket_name=bucket_name
+        bucket_name=bucket_name,
+        max_download_workers=optimal_workers,
+        max_process_workers=optimal_workers,
+        max_retries=5  # Increased for reliability
     )
 
-    pipeline.run()
+    pl.Config.set_streaming_chunk_size(chunk_size)
 
+    # Use ThreadPool for IO-bound operations
+    pipeline.run()
 
 if __name__ == '__main__':
     main()
