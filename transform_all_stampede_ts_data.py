@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import json
 import queue
@@ -13,7 +14,6 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import boto3
-from botocore.exceptions import ClientError
 import concurrent.futures
 from dataclasses import dataclass, asdict
 import logging
@@ -377,7 +377,7 @@ class NodeDownloader:
         self.base_url = base_url
         self.save_dir = save_dir
         self.quota_manager = quota_manager
-        self.max_workers = max_workers
+        self.max_workers = max_workers or multiprocessing.cpu_count()
         self.session = session
         self.process_queue = process_queue
         logger.info(f"NodeDownloader initialized with base URL: {base_url}, save directory: {save_dir}")
