@@ -199,13 +199,28 @@ class MonthlyDataManager:
             for year_month, df in monthly_data.items():
                 file_path = self.get_monthly_file_path(year_month)
 
+                # Convert timestamp to string for storage
+                df_to_save = df.with_columns([
+                    pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
+                ])
+
                 if file_path.exists():
                     existing_df = pl.read_csv(file_path)
-                    merged_df = pl.concat([existing_df, df]).unique()
+
+                    # Convert existing timestamp to datetime for comparison
+                    existing_df = existing_df.with_columns([
+                        pl.col('Timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S').alias('Timestamp')
+                    ])
+
+                    # Convert back to string for storage
+                    merged_df = pl.concat([existing_df, df]).unique().with_columns([
+                        pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
+                    ])
+
                     merged_df.write_csv(file_path)
                     logger.info(f"Merged data into existing file: {file_path}")
                 else:
-                    df.write_csv(file_path)
+                    df_to_save.write_csv(file_path)
                     logger.info(f"Created new monthly file: {file_path}")
 
                 saved_files.append(file_path)
