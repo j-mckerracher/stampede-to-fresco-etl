@@ -254,8 +254,7 @@ class NodeDataProcessor:
     class NodeDataProcessor:
         """Process node data files using Polars"""
 
-        @staticmethod
-        def process_block_file(file_path: Path) -> pl.DataFrame:
+        def process_block_file(self, file_path: Path) -> pl.DataFrame:
             logger.info(f"Processing block file: {file_path}")
             df = pl.read_csv(file_path)
 
@@ -289,8 +288,7 @@ class NodeDataProcessor:
                 pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
             ])
 
-        @staticmethod
-        def process_cpu_file(file_path: Path) -> pl.DataFrame:
+        def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
             logger.info(f"Processing CPU file: {file_path}")
             df = pl.read_csv(file_path)
 
@@ -317,8 +315,7 @@ class NodeDataProcessor:
                 pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
             ])
 
-        @staticmethod
-        def process_nfs_file(file_path: Path) -> pl.DataFrame:
+        def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
             logger.info(f"Processing NFS file: {file_path}")
             df = pl.read_csv(file_path)
 
@@ -345,8 +342,7 @@ class NodeDataProcessor:
                 pl.col('Timestamp')
             ])
 
-        @staticmethod
-        def process_memory_metrics(file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
+        def process_memory_metrics(self, file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
             logger.info(f"Processing memory file: {file_path}")
             df = pl.read_csv(file_path)
 
