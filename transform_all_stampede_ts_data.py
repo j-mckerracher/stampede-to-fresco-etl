@@ -279,10 +279,10 @@ class NodeDataProcessor:
         return df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('block').alias('Event'),
             pl.col('Value'),
-            pl.lit('GB/s').alias('Units'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
+            pl.lit('GB/s').alias('Units')
         ])
 
     def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
@@ -306,10 +306,10 @@ class NodeDataProcessor:
         return df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('cpuuser').alias('Event'),
             pl.col('Value'),
-            pl.lit('CPU %').alias('Units'),
-            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
+            pl.lit('CPU %').alias('Units')
         ])
 
     def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
@@ -333,13 +333,13 @@ class NodeDataProcessor:
         return df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
+            pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
             pl.lit('nfs').alias('Event'),
             pl.col('Value'),
-            pl.lit('MB/s').alias('Units'),
-            pl.col('Timestamp')
+            pl.lit('MB/s').alias('Units')
         ])
 
-    def process_memory_metrics(self, file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
+    def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
         df = pl.read_csv(file_path)
 
@@ -357,7 +357,6 @@ class NodeDataProcessor:
             .alias('memused_minus_diskcache')
         ])
 
-        # Fix: Add specific format string for timestamp parsing
         memused_df = df.select([
             pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
             pl.col('node').alias('Host'),
@@ -376,7 +375,7 @@ class NodeDataProcessor:
             pl.lit('GB').alias('Units')
         ])
 
-        return memused_df, memused_nocache_df
+        return [memused_df, memused_nocache_df]
 
 
 class NodeDownloader:
