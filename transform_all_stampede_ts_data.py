@@ -7,7 +7,7 @@ import shutil
 import threading
 from queue import Queue
 from pathlib import Path
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 import pandas as pd
 import numpy as np
 import requests
@@ -18,6 +18,7 @@ import concurrent.futures
 from dataclasses import dataclass, asdict
 import logging
 from datetime import datetime
+import polars as pl
 
 # Set up logging
 logging.basicConfig(
@@ -30,6 +31,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class NodeStatus:
@@ -191,19 +193,19 @@ class MonthlyDataManager:
         logger.debug(f"Generated monthly file path: {file_path}")
         return file_path
 
-    def save_monthly_data(self, monthly_data: Dict[str, pd.DataFrame]) -> List[Path]:
+    def save_monthly_data(self, monthly_data: Dict[str, pl.DataFrame]) -> List[Path]:
         saved_files = []
         with self._lock:
             for year_month, df in monthly_data.items():
                 file_path = self.get_monthly_file_path(year_month)
 
                 if file_path.exists():
-                    existing_df = pd.read_csv(file_path)
-                    merged_df = pd.concat([existing_df, df]).drop_duplicates()
-                    merged_df.to_csv(file_path, index=False)
+                    existing_df = pl.read_csv(file_path)
+                    merged_df = pl.concat([existing_df, df]).unique()
+                    merged_df.write_csv(file_path)
                     logger.info(f"Merged data into existing file: {file_path}")
                 else:
-                    df.to_csv(file_path, index=False)
+                    df.write_csv(file_path)
                     logger.info(f"Created new monthly file: {file_path}")
 
                 saved_files.append(file_path)
@@ -247,116 +249,136 @@ class S3Uploader:
 
 
 class NodeDataProcessor:
-    """Process node data files"""
+    """Process node data files using Polars"""
 
     @staticmethod
-    def process_block_file(file_path: Path) -> pd.DataFrame:
+    def process_block_file(file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing block file: {file_path}")
-        df = pd.read_csv(file_path)
+        df = pl.read_csv(file_path)
 
         # Calculate throughput
-        df['total_sectors'] = df['rd_sectors'] + df['wr_sectors']
-        df['total_ticks'] = (df['rd_ticks'] + df['wr_ticks']) / 1000
+        df = df.with_columns([
+            pl.col('rd_sectors').alias('rd_sectors_num'),
+            pl.col('wr_sectors').alias('wr_sectors_num'),
+            pl.col('rd_ticks').alias('rd_ticks_num'),
+            pl.col('wr_ticks').alias('wr_ticks_num')
+        ].cast(pl.Float64))
+
+        df = df.with_columns([
+            (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
+            ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
+        ])
 
         # Convert to GB/s
-        df['Value'] = np.where(
-            df['total_ticks'] > 0,
-            (df['total_sectors'] * 512) / df['total_ticks'] / (1024 ** 3),
-            0
-        )
+        df = df.with_columns([
+            pl.when(pl.col('total_ticks') > 0)
+            .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
+            .otherwise(0)
+            .alias('Value')
+        ])
 
-        return pd.DataFrame({
-            'Job Id': df['jobID'].str.replace('job', 'JOB', case=False),
+        return pl.DataFrame({
+            'Job Id': df['jobID'].str.replace_all('job', 'JOB', literal=True),
             'Host': df['node'],
-            'Event': 'block',
+            'Event': pl.lit('block'),
             'Value': df['Value'],
-            'Units': 'GB/s',
-            'Timestamp': pd.to_datetime(df['timestamp'])
+            'Units': pl.lit('GB/s'),
+            'Timestamp': pl.col('timestamp').str.strptime(pl.Datetime)
         })
 
     @staticmethod
-    def process_cpu_file(file_path: Path) -> pd.DataFrame:
+    def process_cpu_file(file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing CPU file: {file_path}")
-        df = pd.read_csv(file_path)
+        df = pl.read_csv(file_path)
 
-        df['total_ticks'] = (
-                df['user'] + df['nice'] + df['system'] +
-                df['idle'] + df['iowait'] + df['irq'] + df['softirq']
-        )
+        df = df.with_columns([
+            (pl.col('user') + pl.col('nice') + pl.col('system') +
+             pl.col('idle') + pl.col('iowait') + pl.col('irq') +
+             pl.col('softirq')).alias('total_ticks')
+        ])
 
-        df['Value'] = np.where(
-            df['total_ticks'] > 0,
-            ((df['user'] + df['nice']) / df['total_ticks']) * 100,
-            0
-        ).clip(0, 100)
+        df = df.with_columns([
+            pl.when(pl.col('total_ticks') > 0)
+            .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
+            .otherwise(0)
+            .clip(0, 100)
+            .alias('Value')
+        ])
 
-        return pd.DataFrame({
-            'Job Id': df['jobID'].str.replace('job', 'JOB', case=False),
+        return pl.DataFrame({
+            'Job Id': df['jobID'].str.replace_all('job', 'JOB', literal=True),
             'Host': df['node'],
-            'Event': 'cpuuser',
+            'Event': pl.lit('cpuuser'),
             'Value': df['Value'],
-            'Units': 'CPU %',
-            'Timestamp': pd.to_datetime(df['timestamp'])
+            'Units': pl.lit('CPU %'),
+            'Timestamp': pl.col('timestamp').str.strptime(pl.Datetime)
         })
 
     @staticmethod
-    def process_nfs_file(file_path: Path) -> pd.DataFrame:
+    def process_nfs_file(file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing NFS file: {file_path}")
-        df = pd.read_csv(file_path)
+        df = pl.read_csv(file_path)
 
-        # Calculate MB/s
-        df['Value'] = (
-                              df['READ_bytes_recv'] + df['WRITE_bytes_sent']
-                      ) / (1024 * 1024)
+        df = df.with_columns([
+            ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
+            pl.col('timestamp').str.strptime(pl.Datetime).alias('Timestamp')
+        ])
 
-        df['Timestamp'] = pd.to_datetime(df['timestamp'])
-        df['TimeDiff'] = df['Timestamp'].diff().dt.total_seconds().fillna(600)
-        df['Value'] = df['Value'] / df['TimeDiff']
+        # Calculate time differences
+        df = df.with_columns([
+            pl.col('Timestamp').diff().cast(pl.Duration).dt.seconds().fill_null(600).alias('TimeDiff')
+        ])
 
-        return pd.DataFrame({
-            'Job Id': df['jobID'].str.replace('job', 'JOB', case=False),
+        df = df.with_columns([
+            (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
+        ])
+
+        return pl.DataFrame({
+            'Job Id': df['jobID'].str.replace_all('job', 'JOB', literal=True),
             'Host': df['node'],
-            'Event': 'nfs',
+            'Event': pl.lit('nfs'),
             'Value': df['Value'],
-            'Units': 'MB/s',
+            'Units': pl.lit('MB/s'),
             'Timestamp': df['Timestamp']
         })
 
     @staticmethod
-    def process_memory_metrics(file_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def process_memory_metrics(file_path: Path) -> Tuple[pl.DataFrame, pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
-        df = pd.read_csv(file_path)
+        df = pl.read_csv(file_path)
 
         # Convert KB to bytes
         memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
-        for col in memory_cols:
-            if col in df.columns:
-                df[col] *= 1024
+        df = df.with_columns([
+            pl.col(col).mul(1024) for col in memory_cols if col in df.columns
+        ])
 
         # Calculate metrics in GB
-        df['memused'] = df['MemUsed'] / (1024 ** 3)
-        df['memused_minus_diskcache'] = (
-                (df['MemUsed'] - df['FilePages']) / (1024 ** 3)
-        ).clip(lower=0)
+        df = df.with_columns([
+            (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
+            ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
+            .clip(0, None)
+            .alias('memused_minus_diskcache')
+        ])
 
-        base_df = {
-            'Job Id': df['jobID'].str.replace('job', 'JOB', case=False),
+        base_data = {
+            'Job Id': df['jobID'].str.replace_all('job', 'JOB', literal=True),
             'Host': df['node'],
-            'Timestamp': pd.to_datetime(df['timestamp'])
+            'Timestamp': pl.col('timestamp').str.strptime(pl.Datetime)
         }
 
-        memused_df = pd.DataFrame({
-            **base_df,
-            'Event': 'memused',
+        memused_df = pl.DataFrame({
+            **base_data,
+            'Event': pl.lit('memused'),
             'Value': df['memused'],
-            'Units': 'GB'
+            'Units': pl.lit('GB')
         })
 
-        memused_nocache_df = pd.DataFrame({
-            **base_df,
-            'Event': 'memused_minus_diskcache',
+        memused_nocache_df = pl.DataFrame({
+            **base_data,
+            'Event': pl.lit('memused_minus_diskcache'),
             'Value': df['memused_minus_diskcache'],
-            'Units': 'GB'
+            'Units': pl.lit('GB')
         })
 
         return memused_df, memused_nocache_df
@@ -508,13 +530,89 @@ class ETLPipeline:
         try:
             monthly_files = list(self.monthly_data_manager.monthly_data_dir.glob('*.csv'))
             for file_path in monthly_files:
-                df = pd.read_csv(file_path)
+                df = pl.read_csv(file_path)
                 # Remove rows where Host matches the failed node
-                df = df[df['Host'] != node_name]
-                df.to_csv(file_path, index=False)
+                df = df.filter(pl.col('Host') != node_name)
+                df.write_csv(file_path)
             logger.info(f"Cleaned up data for failed node: {node_name}")
         except Exception as e:
             logger.error(f"Error cleaning up node {node_name}: {e}")
+
+    def process_worker(self):
+        while not self.should_stop.is_set():
+            try:
+                logger.info(f"Process worker waiting for node...")
+                node_name = self.process_queue.get(timeout=1)
+                with self._lock:
+                    self.active_processing.add(node_name)
+                logger.info(f"Processing node {node_name}")
+                start_time = time.time()
+
+                node_dir = self.base_dir / node_name
+                if not node_dir.exists():
+                    logger.warning(f"Node directory missing: {node_name}")
+                    continue
+
+                try:
+                    # Process each file type
+                    dfs = []
+
+                    # Process block file
+                    block_path = node_dir / 'block.csv'
+                    if block_path.exists():
+                        dfs.append(self.processor.process_block_file(block_path))
+
+                    # Process CPU file
+                    cpu_path = node_dir / 'cpu.csv'
+                    if cpu_path.exists():
+                        dfs.append(self.processor.process_cpu_file(cpu_path))
+
+                    # Process NFS file
+                    nfs_path = node_dir / 'nfs.csv'
+                    if nfs_path.exists():
+                        dfs.append(self.processor.process_nfs_file(nfs_path))
+
+                    # Process memory file
+                    mem_path = node_dir / 'mem.csv'
+                    if mem_path.exists():
+                        memused_df, memused_nocache_df = self.processor.process_memory_metrics(mem_path)
+                        dfs.extend([memused_df, memused_nocache_df])
+
+                    if dfs:
+                        combined_df = pl.concat(dfs)
+                        # Group by month
+                        monthly_data = {}
+                        for group in combined_df.partition_by('Timestamp', as_dict=True):
+                            month_key = group['Timestamp'][0].strftime('%Y-%m')
+                            monthly_data[month_key] = group
+
+                        self.monthly_data_manager.save_monthly_data(monthly_data)
+
+                    self.state_manager.update_node_status(
+                        node_name,
+                        processing_complete=True,
+                        processing_started=False
+                    )
+                    shutil.rmtree(node_dir)
+                    processing_time = time.time() - start_time
+                    logger.info(f"Processing complete: {node_name} - Processing time: {processing_time:.2f} seconds")
+
+                except Exception as e:
+                    logger.error(f"Error processing {node_name}: {e}", exc_info=True)
+                    self.state_manager.update_node_status(
+                        node_name,
+                        processing_complete=False,
+                        processing_started=False
+                    )
+
+                with self._lock:
+                    self.active_processing.remove(node_name)
+                self.process_queue.task_done()
+
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in process worker: {e}", exc_info=True)
 
     def get_node_list(self) -> List[str]:
         retry_count = 0
@@ -567,88 +665,6 @@ class ETLPipeline:
                 continue
             except Exception as e:
                 logging.error(f"Error in download worker: {e}", exc_info=True)
-
-    def process_worker(self):
-        while not self.should_stop.is_set():
-            try:
-                logger.info(f"Process worker waiting for node...")
-                node_name = self.process_queue.get(timeout=1)
-                with self._lock:
-                    self.active_processing.add(node_name)
-                logger.info(f"Processing node {node_name}")
-
-                node_dir = self.base_dir / node_name
-                if not node_dir.exists():
-                    logger.warning(f"Node directory missing: {node_name}")
-                    continue
-
-                try:
-                    # Process each file type
-                    dfs = []
-
-                    # Process block file
-                    block_path = node_dir / 'block.csv'
-                    if block_path.exists():
-                        dfs.append(self.processor.process_block_file(block_path))
-
-                    # Process CPU file
-                    cpu_path = node_dir / 'cpu.csv'
-                    if cpu_path.exists():
-                        dfs.append(self.processor.process_cpu_file(cpu_path))
-
-                    # Process NFS file
-                    nfs_path = node_dir / 'nfs.csv'
-                    if nfs_path.exists():
-                        dfs.append(self.processor.process_nfs_file(nfs_path))
-
-                    # Process memory file
-                    mem_path = node_dir / 'mem.csv'
-                    if mem_path.exists():
-                        memused_df, memused_nocache_df = self.processor.process_memory_metrics(mem_path)
-                        dfs.extend([memused_df, memused_nocache_df])
-
-                    if dfs:
-                        combined_df = pd.concat(dfs, ignore_index=True)
-                        # Group by month
-                        monthly_data = {}
-                        for _, row in combined_df.iterrows():
-                            month_key = row['Timestamp'].strftime('%Y-%m')
-                            if month_key not in monthly_data:
-                                monthly_data[month_key] = []
-                            monthly_data[month_key].append(row)
-
-                        # Convert lists to DataFrames
-                        monthly_dfs = {
-                            month: pd.DataFrame(rows)
-                            for month, rows in monthly_data.items()
-                        }
-
-                        self.monthly_data_manager.save_monthly_data(monthly_dfs)
-
-                    self.state_manager.update_node_status(
-                        node_name,
-                        processing_complete=True,
-                        processing_started=False
-                    )
-                    shutil.rmtree(node_dir)
-                    logger.info(f"Processing complete: {node_name}")
-
-                except Exception as e:
-                    logger.error(f"Error processing {node_name}: {e}", exc_info=True)
-                    self.state_manager.update_node_status(
-                        node_name,
-                        processing_complete=False,
-                        processing_started=False
-                    )
-
-                with self._lock:
-                    self.active_processing.remove(node_name)
-                self.process_queue.task_done()
-
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Error in process worker: {e}", exc_info=True)
 
     def check_upload_needed(self) -> bool:
         """Check if we should trigger an S3 upload based on data volume"""
