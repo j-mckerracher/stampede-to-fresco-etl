@@ -299,14 +299,14 @@ class NodeDataProcessor:
 
     def process_block_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing block file: {file_path}")
-        # Use streaming for large files
-        df = pl.scan_csv(file_path)
+        df = pl.read_csv(file_path)
 
-        # Optimize calculations using lazy evaluation
+        # Calculate throughput - cast columns individually
         df = df.with_columns([
-            pl.col(['rd_sectors', 'wr_sectors', 'rd_ticks', 'wr_ticks'])
-            .cast(pl.Float64)
-            .suffix('_num')
+            pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
+            pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
+            pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
+            pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
         ])
 
         df = df.with_columns([
@@ -314,7 +314,7 @@ class NodeDataProcessor:
             ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
         ])
 
-        # Use lazy evaluation for better performance
+        # Convert to GB/s
         df = df.with_columns([
             pl.when(pl.col('total_ticks') > 0)
             .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
@@ -329,7 +329,7 @@ class NodeDataProcessor:
             pl.lit('block').alias('Event'),
             pl.col('Value'),
             pl.lit('GB/s').alias('Units')
-        ]).collect(streaming=True)
+        ])
 
     def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
