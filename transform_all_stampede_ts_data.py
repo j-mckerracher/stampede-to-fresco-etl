@@ -323,7 +323,7 @@ class NodeDataProcessor:
 
         # Calculate time differences
         df = df.with_columns([
-            pl.col('Timestamp').diff().cast(pl.Duration).dt.seconds().fill_null(600).alias('TimeDiff')
+            pl.col('Timestamp').diff().cast(pl.Duration).dt.total_seconds().fill_null(600).alias('TimeDiff')
         ])
 
         df = df.with_columns([
