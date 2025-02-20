@@ -550,7 +550,6 @@ class ETLPipeline:
     def process_worker(self):
         while not self.should_stop.is_set():
             try:
-                logger.info(f"Process worker waiting for node...")
                 node_name = self.process_queue.get(timeout=1)
                 with self._lock:
                     self.active_processing.add(node_name)
