@@ -575,13 +575,16 @@ class ETLPipeline:
                     if dfs:
                         combined_df = pl.concat(dfs)
 
-                        # Group by month using Polars syntax
+                        # Add a month column for partitioning
+                        combined_df = combined_df.with_columns([
+                            pl.col('Timestamp').dt.strftime('%Y-%m').alias('month')
+                        ])
+
+                        # Group by the new month column
                         monthly_data = {}
-                        for group in combined_df.partition_by(
-                                pl.col('Timestamp').dt.strftime('%Y-%m')
-                        ):
-                            month_key = group['Timestamp'][0].dt.strftime('%Y-%m')
-                            monthly_data[month_key] = group
+                        for group in combined_df.partition_by('month'):
+                            month_key = group[0, 'month']  # Get first row's month value
+                            monthly_data[month_key] = group.drop('month')  # Remove temporary month column
 
                         self.monthly_data_manager.save_monthly_data(monthly_data)
 
