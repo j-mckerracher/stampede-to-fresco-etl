@@ -55,7 +55,7 @@ CONFIG = {
     'connect_timeout': 10,                    # Connection timeout in seconds
     's3_timeout': 300,                        # S3 upload timeout in seconds
     'upload_batch_size': 50,                  # Number of nodes to process before uploading to S3
-    'resume_node': 'NODE1024',                      # Node to resume from (None = auto from state file)
+    'resume_node': None,                      # Node to resume from (None = auto from state file)
     'aws_access_key_id': os.environ.get('AWS_ACCESS_KEY_ID'),  # AWS credentials
     'aws_secret_access_key': os.environ.get('AWS_SECRET_ACCESS_KEY')
 }

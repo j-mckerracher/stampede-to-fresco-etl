@@ -7,11 +7,9 @@ This script:
 2. Removes all rows containing a specified NODE value
 3. Uploads the modified files back to the original S3 bucket
 """
-
 import os
 import sys
 import logging
-import tempfile
 from pathlib import Path
 import boto3
 import pandas as pd
