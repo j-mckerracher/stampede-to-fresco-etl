@@ -1,14 +1,14 @@
-#!/usr/bin/env python3
 """
-ETL Script for Node Data Processing
+Optimized ETL Script for Node Data Processing
 
 This script downloads node data, processes it into monthly files,
 and uploads the results to AWS S3. Features include:
 1. Sequential node processing with parallel internal operations
 2. Disk quota management to stay under 24GB
 3. File versioning
-4. Resumability in case of failure
-5. Optimized performance
+4. Efficient S3 operations with local caching
+5. Full resumability with node tracking
+6. Optimized performance
 """
 import concurrent
 import os
@@ -16,18 +16,15 @@ import sys
 import time
 import shutil
 import logging
-import argparse
 import threading
 import multiprocessing
-from typing import List, Dict, Set, Tuple, Optional, Any
+from typing import List, Dict, Set
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import traceback
 import json
-import re
-
 import boto3
 import requests
 from bs4 import BeautifulSoup
@@ -43,6 +40,25 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Configuration (replace command line arguments)
+CONFIG = {
+    'base_url': 'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/',  # Base URL for node data
+    'temp_dir': './temp',                     # Temporary directory for downloads
+    'monthly_dir': './monthly_files',         # Directory for monthly files
+    'cache_dir': './cache',                   # Cache directory for monthly files
+    's3_bucket': 'data-transform-stampede',   # S3 bucket for uploads
+    'quota_mb': 24512,                        # Disk quota in MB (24GB)
+    'download_workers': 4,                    # Max parallel downloads
+    'process_workers': None,                  # Max parallel processing workers (None = auto)
+    'download_timeout': 300,                  # Download timeout in seconds
+    'connect_timeout': 10,                    # Connection timeout in seconds
+    's3_timeout': 300,                        # S3 upload timeout in seconds
+    'upload_batch_size': 50,                  # Number of nodes to process before uploading to S3
+    'resume_node': None,                      # Node to resume from (None = auto from state file)
+    'aws_access_key_id': os.environ.get('AWS_ACCESS_KEY_ID'),  # AWS credentials
+    'aws_secret_access_key': os.environ.get('AWS_SECRET_ACCESS_KEY')
+}
 
 
 class DownloadProgressTracker:
@@ -107,7 +123,7 @@ class DiskQuotaManager:
                 return True
             else:
                 logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
-                              f"Current: {current_usage}/{self.max_quota_mb} MB")
+                               f"Current: {current_usage}/{self.max_quota_mb} MB")
                 return False
 
     def release_space(self, mb_to_release: int):
@@ -125,21 +141,26 @@ class DiskQuotaManager:
 
 
 class MonthlyFileManager:
-    """Manage monthly data files"""
+    """Manage monthly data files with improved tracking and caching"""
 
-    def __init__(self, monthly_dir: Path, state_file: Path):
+    def __init__(self, monthly_dir: Path, cache_dir: Path, state_file: Path):
         self.monthly_dir = monthly_dir
+        self.cache_dir = cache_dir
         self.state_file = state_file
         self.current_node = None
-        self.monthly_files = {}  # Format: {'YYYY-MM': 'file_path'}
+        self.processed_nodes = set()  # Track processed nodes
+        self.modified_files = set()   # Track modified files that need to be uploaded
+        self.monthly_files = {}       # Format: {'YYYY-MM': 'file_path'}
         self.lock = threading.Lock()
 
         # Create dirs if they don't exist
         self.monthly_dir.mkdir(exist_ok=True, parents=True)
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
 
         # Load state if it exists
         self._load_state()
-        logger.info(f"MonthlyFileManager initialized with dir: {monthly_dir}")
+        logger.info(f"MonthlyFileManager initialized with dir: {monthly_dir}, cache: {cache_dir}")
+        logger.info(f"Loaded {len(self.processed_nodes)} previously processed nodes")
 
     def _load_state(self):
         """Load processing state from file"""
@@ -151,9 +172,21 @@ class MonthlyFileManager:
                 if 'current_node' in state:
                     self.current_node = state['current_node']
                     logger.info(f"Loaded state: current node: {self.current_node}")
+
+                # Load processed nodes
+                if 'processed_nodes' in state:
+                    self.processed_nodes = set(state['processed_nodes'])
+                    logger.info(f"Loaded {len(self.processed_nodes)} processed nodes from state")
+
+                # Load modified files
+                if 'modified_files' in state:
+                    self.modified_files = set(state['modified_files'])
+                    logger.info(f"Loaded {len(self.modified_files)} modified files from state")
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
                 self.current_node = None
+                self.processed_nodes = set()
+                self.modified_files = set()
         else:
             logger.info("No state file found, starting fresh")
 
@@ -161,7 +194,9 @@ class MonthlyFileManager:
         """Save processing state to file"""
         try:
             state = {
-                'current_node': self.current_node
+                'current_node': self.current_node,
+                'processed_nodes': list(self.processed_nodes),
+                'modified_files': list(self.modified_files)
             }
 
             with open(self.state_file, 'w') as f:
@@ -170,6 +205,30 @@ class MonthlyFileManager:
             logger.debug(f"Saved state to {self.state_file}")
         except Exception as e:
             logger.error(f"Error saving state file: {e}")
+
+    def mark_file_modified(self, file_path: Path):
+        """Mark a file as modified so it will be uploaded to S3"""
+        with self.lock:
+            self.modified_files.add(str(file_path))
+            self._save_state()
+            logger.debug(f"Marked file as modified: {file_path}")
+
+    def get_modified_files(self) -> List[Path]:
+        """Get list of modified files that need to be uploaded"""
+        with self.lock:
+            return [Path(f) for f in self.modified_files]
+
+    def clear_modified_files(self):
+        """Clear the list of modified files after upload"""
+        with self.lock:
+            self.modified_files.clear()
+            self._save_state()
+            logger.debug("Cleared modified files list")
+
+    def is_node_processed(self, node_name: str) -> bool:
+        """Check if a node has already been processed"""
+        with self.lock:
+            return node_name in self.processed_nodes
 
     def start_node_processing(self, node_name: str) -> bool:
         """Mark a node as currently being processed"""
@@ -189,6 +248,7 @@ class MonthlyFileManager:
         with self.lock:
             if self.current_node == node_name:
                 self.current_node = None
+                self.processed_nodes.add(node_name)  # Add to processed nodes
                 self._save_state()
                 logger.info(f"Finished processing node: {node_name}")
             else:
@@ -216,6 +276,7 @@ class MonthlyFileManager:
 
                         # Write back to file
                         df_filtered.write_csv(file_path)
+                        self.mark_file_modified(file_path)
                         logger.info(f"Removed {len(df) - len(df_filtered)} rows for {node_name} from {file_path}")
                 except Exception as e:
                     logger.error(f"Error cleaning node data from {file_path}: {e}")
@@ -223,7 +284,7 @@ class MonthlyFileManager:
     def get_monthly_file_path(self, timestamp: datetime) -> Path:
         """Get the file path for a timestamp"""
         month_key = timestamp.strftime('%Y-%m')
-        return self.monthly_dir / f"node_data_{month_key}.csv"
+        return self.cache_dir / f"node_data_{month_key}.csv"
 
     def get_monthly_files_for_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
         """Get mapping of month to file path for all months in the data"""
@@ -494,8 +555,8 @@ class NodeDownloader:
             quota_manager: DiskQuotaManager,
             session: requests.Session,
             max_workers: int = 3,
-            download_timeout: int = 300,  # Added download timeout parameter
-            connect_timeout: int = 10  # Added connect timeout parameter
+            download_timeout: int = 300,
+            connect_timeout: int = 10
     ):
         self.base_url = base_url
         self.save_dir = save_dir
@@ -894,7 +955,7 @@ class S3Manager:
         """Upload multiple files to S3 with retry logic"""
         success = True
         self.upload_results = {}  # Clear previous results
-        self.upload_errors = {}   # Clear previous errors
+        self.upload_errors = {}  # Clear previous errors
 
         for file_path in file_paths:
             str_path = str(file_path)  # Use string path as dict key
@@ -958,7 +1019,7 @@ class S3Manager:
 
         # Summarize results
         failed_files = [path for path, result in self.upload_results.items()
-                       if not result.get('success', False)]
+                        if not result.get('success', False)]
 
         if failed_files:
             logger.error(f"Failed to upload {len(failed_files)} files: {failed_files}")
@@ -1001,13 +1062,14 @@ class S3Manager:
 
 
 class NodeETL:
-    """Main ETL class to orchestrate node data processing"""
+    """Main ETL class to orchestrate node data processing with optimized S3 operations"""
 
     def __init__(
             self,
             base_url: str,
             temp_dir: Path,
             monthly_dir: Path,
+            cache_dir: Path,  # New cache directory
             s3_bucket: str,
             max_quota_mb: int = 24512,  # 24GB default
             max_download_workers: int = 3,
@@ -1015,24 +1077,30 @@ class NodeETL:
             download_timeout: int = 300,
             connect_timeout: int = 10,
             s3_timeout: int = 300,
+            upload_batch_size: int = 50,  # New batch size parameter
+            resume_node: str = None,  # New resume node parameter
             aws_access_key_id: str = None,
             aws_secret_access_key: str = None
-        ):
+    ):
         self.base_url = base_url
         self.temp_dir = temp_dir
         self.monthly_dir = monthly_dir
+        self.cache_dir = cache_dir
         self.s3_bucket = s3_bucket
+        self.upload_batch_size = upload_batch_size
+        self.resume_node = resume_node
 
         # Create directories
         self.temp_dir.mkdir(exist_ok=True, parents=True)
         self.monthly_dir.mkdir(exist_ok=True, parents=True)
+        self.cache_dir.mkdir(exist_ok=True, parents=True)
 
         # State file location
         self.state_file = self.monthly_dir / 'etl_state.json'
 
         # Initialize managers
         self.quota_manager = DiskQuotaManager(max_quota_mb, temp_dir)
-        self.monthly_file_manager = MonthlyFileManager(monthly_dir, self.state_file)
+        self.monthly_file_manager = MonthlyFileManager(monthly_dir, cache_dir, self.state_file)
 
         # Worker settings
         self.max_download_workers = max_download_workers
@@ -1070,7 +1138,8 @@ class NodeETL:
         )
 
         logger.info(f"NodeETL initialized. Temp dir: {temp_dir}, Monthly dir: {monthly_dir}, "
-                    f"S3 bucket: {s3_bucket}, Max quota: {max_quota_mb} MB")
+                    f"Cache dir: {cache_dir}, S3 bucket: {s3_bucket}, Max quota: {max_quota_mb} MB, "
+                    f"Upload batch size: {upload_batch_size}")
 
     def process_node_data_to_monthly(self, node_data: pl.DataFrame) -> Dict[str, pl.DataFrame]:
         """Split node data into monthly DataFrames"""
@@ -1095,45 +1164,49 @@ class NodeETL:
             logger.error(f"Error splitting data into monthly groups: {e}")
             return {}
 
-    def download_s3_monthly_files(self, months: List[str]) -> Dict[str, Path]:
-        """Download monthly files from S3 for specified months"""
-        logger.info(f"Checking S3 for existing monthly files for months: {months}")
+    def download_all_monthly_files(self) -> Dict[str, Path]:
+        """Download all monthly files from S3 at the beginning of the ETL process"""
+        logger.info("Initializing local cache by downloading all monthly files from S3")
 
-        # List files in the bucket
+        # List all files in the bucket
         s3_files = self.s3_manager.list_files()
+
+        # Filter for node_data CSV files
+        monthly_files = [f for f in s3_files if f.startswith('node_data_') and f.endswith('.csv')]
+
+        if not monthly_files:
+            logger.info("No existing monthly files found in S3 bucket")
+            return {}
+
+        logger.info(f"Found {len(monthly_files)} monthly files in S3 bucket")
 
         # Map of month to downloaded file path
         downloaded_files = {}
 
-        for month in months:
-            # Look for month pattern in S3 files
-            expected_filename = f"node_data_{month}.csv"
-            matching_files = [f for f in s3_files if f == expected_filename]
+        for s3_key in monthly_files:
+            try:
+                # Extract month from filename (format: node_data_YYYY-MM.csv)
+                month = s3_key.replace('node_data_', '').replace('.csv', '')
 
-            if matching_files:
-                s3_key = matching_files[0]
-                local_path = self.monthly_dir / s3_key
+                # Download to cache directory
+                local_path = self.cache_dir / s3_key
 
-                # Download the file
                 if self.s3_manager.download_file(s3_key, local_path):
                     downloaded_files[month] = local_path
-                    logger.info(f"Downloaded {s3_key} from S3")
-            else:
-                logger.info(f"No existing S3 file found for month {month}")
+                    logger.info(f"Downloaded {s3_key} from S3 to local cache")
+                else:
+                    logger.error(f"Failed to download {s3_key} from S3")
+            except Exception as e:
+                logger.error(f"Error downloading {s3_key}: {e}")
 
+        logger.info(f"Successfully downloaded {len(downloaded_files)} monthly files to local cache")
         return downloaded_files
 
     def handle_monthly_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
-        """Process monthly data - download from S3 if exists, append, and prepare for upload"""
+        """Process monthly data - append to cached files (no immediate upload)"""
         if not monthly_data:
             logger.warning("No monthly data to handle")
             return {}
-
-        # Get list of months we have data for
-        months = list(monthly_data.keys())
-
-        # Download existing monthly files from S3
-        s3_monthly_files = self.download_s3_monthly_files(months)
 
         # Get mapping of month to file path for all months
         month_file_map = self.monthly_file_manager.get_monthly_files_for_data(monthly_data)
@@ -1152,40 +1225,24 @@ class NodeETL:
                 # Get the file path for this month
                 file_path = month_file_map[month]
 
-                # Check if we downloaded a file from S3
-                if month in s3_monthly_files:
-                    s3_file_path = s3_monthly_files[month]
+                # Check if we have a cached file to append to
+                if file_path.exists() and file_path.stat().st_size > 0:
+                    # Read existing file
+                    existing_df = pl.read_csv(file_path)
 
-                    # Read the S3 file
-                    existing_df = pl.read_csv(s3_file_path)
-
-                    # Append our new data
+                    # Append new data
                     combined_df = pl.concat([existing_df, df])
 
-                    # Write to our local monthly file
+                    # Write back to file
                     combined_df.write_csv(file_path)
-                    logger.info(f"Appended {len(df)} rows to existing S3 data for month {month}")
-
-                    # Clean up the downloaded S3 file if it's different from our output file
-                    if s3_file_path != file_path and s3_file_path.exists():
-                        os.remove(s3_file_path)
-                        logger.debug(f"Removed downloaded S3 file: {s3_file_path}")
+                    logger.info(f"Appended {len(df)} rows to existing cached file for month {month}")
                 else:
-                    # Check if we have a local file to append to
-                    if file_path.exists() and file_path.stat().st_size > 0:
-                        # Read existing file
-                        existing_df = pl.read_csv(file_path)
+                    # Create new file
+                    df.write_csv(file_path)
+                    logger.info(f"Created new monthly file for month {month}")
 
-                        # Append new data
-                        combined_df = pl.concat([existing_df, df])
-
-                        # Write back to file
-                        combined_df.write_csv(file_path)
-                        logger.info(f"Appended {len(df)} rows to existing local file for month {month}")
-                    else:
-                        # Create new file
-                        df.write_csv(file_path)
-                        logger.info(f"Created new monthly file for month {month}")
+                # Mark file as modified
+                self.monthly_file_manager.mark_file_modified(file_path)
 
                 # Add to list of processed files
                 processed_files[month] = file_path
@@ -1195,17 +1252,30 @@ class NodeETL:
 
         return processed_files
 
-    def upload_monthly_files(self, file_paths: List[Path]) -> bool:
-        """Upload monthly files to S3"""
-        if not file_paths:
-            logger.warning("No monthly files to upload")
-            return False
+    def upload_modified_files(self) -> bool:
+        """Upload all modified files to S3"""
+        modified_files = self.monthly_file_manager.get_modified_files()
 
-        logger.info(f"Uploading {len(file_paths)} monthly files to S3")
-        return self.s3_manager.upload_files(file_paths)
+        if not modified_files:
+            logger.info("No modified files to upload")
+            return True
+
+        logger.info(f"Uploading {len(modified_files)} modified files to S3")
+
+        # Upload files
+        success = self.s3_manager.upload_files(modified_files)
+
+        if success:
+            # Clear the modified files list
+            self.monthly_file_manager.clear_modified_files()
+            logger.info(f"Successfully uploaded {len(modified_files)} files to S3")
+        else:
+            logger.error(f"Failed to upload some modified files to S3")
+
+        return success
 
     def process_node(self, node_name: str) -> bool:
-        """Process a single node end-to-end"""
+        """Process a single node end-to-end (without immediate S3 upload)"""
         logger.info(f"Starting end-to-end processing for node: {node_name}")
 
         # Check if we're already processing this node (resuming after failure)
@@ -1213,6 +1283,11 @@ class NodeETL:
         if self.monthly_file_manager.current_node == node_name:
             logger.info(f"Resuming processing for node {node_name}")
             resuming = True
+
+        # Check if this node has already been processed
+        if self.monthly_file_manager.is_node_processed(node_name):
+            logger.info(f"Node {node_name} has already been processed, skipping")
+            return True
 
         # Start processing this node
         if not resuming:
@@ -1246,17 +1321,11 @@ class NodeETL:
             # Split into monthly datasets
             monthly_data = self.process_node_data_to_monthly(node_df)
 
-            # Handle monthly data - download from S3 if exists, append, prepare for upload
+            # Handle monthly data - append to cached files (no immediate upload)
             if monthly_data:
                 processed_files = self.handle_monthly_data(monthly_data)
-
-                # Upload to S3
                 if processed_files:
-                    files_to_upload = list(processed_files.values())
-                    upload_success = self.upload_monthly_files(files_to_upload)
-
-                    if not upload_success:
-                        logger.error(f"Failed to upload monthly files for node {node_name}")
+                    logger.info(f"Updated {len(processed_files)} monthly files for node {node_name}")
                 else:
                     logger.warning(f"No monthly files processed for node {node_name}")
 
@@ -1287,13 +1356,38 @@ class NodeETL:
 
         return success
 
+    def sort_nodes_lexicographic(self, node_names: List[str]) -> List[str]:
+        """Sort node names lexicographically (NODE1, NODE10, NODE100, etc.)"""
+        return sorted(node_names)
+
     def process_nodes_sequential(self, node_names: List[str]) -> int:
-        """Process nodes sequentially, returning count of successful nodes"""
+        """Process nodes sequentially with batched uploads, returning count of successful nodes"""
         logger.info(f"Processing {len(node_names)} nodes sequentially")
+
+        # Sort nodes for consistent processing order (lexicographic)
+        sorted_nodes = self.sort_nodes_lexicographic(node_names)
+
+        # Handle resume node logic
+        if self.resume_node:
+            logger.info(f"Resuming from node {self.resume_node}")
+            # Find the index of the resume node
+            try:
+                resume_idx = sorted_nodes.index(self.resume_node)
+                # Skip all nodes up to and including the resume node
+                sorted_nodes = sorted_nodes[resume_idx + 1:]
+                logger.info(f"Skipping {resume_idx + 1} nodes, processing remaining {len(sorted_nodes)} nodes")
+            except ValueError:
+                logger.warning(f"Resume node {self.resume_node} not found in node list, starting from beginning")
+
+        # Filter out already processed nodes
+        nodes_to_process = [node for node in sorted_nodes
+                           if not self.monthly_file_manager.is_node_processed(node)]
+
+        logger.info(f"Processing {len(nodes_to_process)} nodes after filtering already processed nodes")
 
         # Check if we need to resume an interrupted node first
         current_node = self.monthly_file_manager.current_node
-        if current_node and current_node in node_names:
+        if current_node and current_node in nodes_to_process:
             logger.info(f"Resuming interrupted node {current_node} first")
 
             # Process the current node first
@@ -1301,24 +1395,42 @@ class NodeETL:
 
             # Remove from list if successfully processed
             if success:
-                node_names = [n for n in node_names if n != current_node]
+                nodes_to_process = [n for n in nodes_to_process if n != current_node]
 
         successful_nodes = 0
         failed_nodes = []
+        nodes_since_upload = 0
 
-        # Process each node sequentially (to fulfill requirement #1)
-        for node in node_names:
+        # Process each node sequentially
+        for node in nodes_to_process:
             try:
                 success = self.process_node(node)
                 if success:
                     successful_nodes += 1
+                    nodes_since_upload += 1
                     logger.info(f"Successfully processed node: {node}")
                 else:
                     failed_nodes.append(node)
                     logger.warning(f"Failed to process node: {node}")
+
+                # Upload to S3 in batches
+                if nodes_since_upload >= self.upload_batch_size:
+                    logger.info(f"Processed {nodes_since_upload} nodes since last upload, uploading modified files to S3")
+                    upload_success = self.upload_modified_files()
+                    if upload_success:
+                        nodes_since_upload = 0
+                        logger.info("Successfully uploaded batch of files to S3")
+                    else:
+                        logger.warning("Failed to upload some files, will retry in next batch")
+
             except Exception as e:
                 logger.error(f"Exception processing node {node}: {e}")
                 failed_nodes.append(node)
+
+        # Final upload of any remaining modified files
+        if nodes_since_upload > 0:
+            logger.info(f"Uploading final batch of {nodes_since_upload} nodes")
+            self.upload_modified_files()
 
         if failed_nodes:
             logger.warning(f"Failed to process {len(failed_nodes)} nodes: {failed_nodes}")
@@ -1330,6 +1442,10 @@ class NodeETL:
         logger.info("Starting ETL pipeline")
 
         try:
+            # First, download all monthly files from S3 to local cache
+            logger.info("Initializing cache by downloading all monthly files from S3")
+            self.download_all_monthly_files()
+
             # Discover nodes
             nodes = self.node_discoverer.discover_nodes()
             if not nodes:
@@ -1341,6 +1457,13 @@ class NodeETL:
             # Process nodes sequentially (one at a time)
             successful_nodes = self.process_nodes_sequential(nodes)
             logger.info(f"Successfully processed {successful_nodes}/{len(nodes)} nodes")
+
+            # Final upload to S3 (may be redundant but ensures we upload everything)
+            logger.info("Final upload of all modified files to S3")
+            upload_success = self.upload_modified_files()
+
+            if not upload_success:
+                logger.error("Failed to upload some files in final upload")
 
             if successful_nodes > 0:
                 logger.info("ETL pipeline completed successfully")
@@ -1357,42 +1480,23 @@ class NodeETL:
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description='ETL Script for Node Data Processing')
-    parser.add_argument('--base-url', type=str, required=False, help='Base URL for node data')
-    parser.add_argument('--temp-dir', type=str, default='./temp', help='Temporary directory for downloads')
-    parser.add_argument('--monthly-dir', type=str, default='./monthly_files', help='Directory for monthly files')
-    parser.add_argument('--s3-bucket', type=str, required=False, help='S3 bucket for uploads')
-    parser.add_argument('--quota-mb', type=int, default=24512, help='Disk quota in MB (default: 24GB)')
-    parser.add_argument('--download-workers', type=int, default=3, help='Max parallel downloads')
-    parser.add_argument('--process-workers', type=int, default=None, help='Max parallel processing workers')
-    parser.add_argument('--download-timeout', type=int, default=300, help='Download timeout in seconds')
-    parser.add_argument('--connect-timeout', type=int, default=10, help='Connection timeout in seconds')
-    parser.add_argument('--s3-timeout', type=int, default=300, help='S3 upload timeout in seconds')
-    parser.add_argument('--aws-access-key-id', type=str, help='AWS Access Key ID')
-    parser.add_argument('--aws-secret-access-key', type=str, help='AWS Secret Access Key')
-    parser.add_argument('--log-level', type=str, default='INFO',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                        help='Logging level')
-
-    args = parser.parse_args()
-
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
-
-    # Create ETL pipeline
+    # Initialize ETL with configuration
     etl = NodeETL(
-        base_url="https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/",
-        temp_dir=Path(args.temp_dir),
-        monthly_dir=Path(args.monthly_dir),
-        s3_bucket="data-transform-stampede",
-        max_quota_mb=args.quota_mb,
-        max_download_workers=args.download_workers,
-        max_process_workers=args.process_workers,
-        download_timeout=args.download_timeout,
-        connect_timeout=args.connect_timeout,
-        s3_timeout=args.s3_timeout,
-        aws_access_key_id=args.aws_access_key_id,
-        aws_secret_access_key=args.aws_secret_access_key
+        base_url=CONFIG['base_url'],
+        temp_dir=Path(CONFIG['temp_dir']),
+        monthly_dir=Path(CONFIG['monthly_dir']),
+        cache_dir=Path(CONFIG['cache_dir']),
+        s3_bucket=CONFIG['s3_bucket'],
+        max_quota_mb=CONFIG['quota_mb'],
+        max_download_workers=CONFIG['download_workers'],
+        max_process_workers=CONFIG['process_workers'],
+        download_timeout=CONFIG['download_timeout'],
+        connect_timeout=CONFIG['connect_timeout'],
+        s3_timeout=CONFIG['s3_timeout'],
+        upload_batch_size=CONFIG['upload_batch_size'],
+        resume_node=CONFIG['resume_node'],
+        aws_access_key_id=CONFIG['aws_access_key_id'],
+        aws_secret_access_key=CONFIG['aws_secret_access_key']
     )
 
     # Run pipeline
