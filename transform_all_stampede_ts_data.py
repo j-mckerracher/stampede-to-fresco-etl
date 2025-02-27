@@ -18,15 +18,13 @@ import logging
 import argparse
 import threading
 import multiprocessing
-from typing import List, Dict, Set, Tuple, Optional, Any
+from typing import List, Dict
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import traceback
 import json
-import re
-
 import boto3
 import requests
 from bs4 import BeautifulSoup
@@ -1319,3 +1317,54 @@ class NodeETL:
             logger.error(f"Error in ETL pipeline: {e}")
             logger.error(traceback.format_exc())
             return False
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='ETL Script for Node Data Processing')
+    parser.add_argument('--base-url', type=str, required=False, help='Base URL for node data')
+    parser.add_argument('--temp-dir', type=str, default='./temp', help='Temporary directory for downloads')
+    parser.add_argument('--monthly-dir', type=str, default='./monthly_files', help='Directory for monthly files')
+    parser.add_argument('--s3-bucket', type=str, required=False, help='S3 bucket for uploads')
+    parser.add_argument('--quota-mb', type=int, default=24512, help='Disk quota in MB (default: 24GB)')
+    parser.add_argument('--download-workers', type=int, default=3, help='Max parallel downloads')
+    parser.add_argument('--process-workers', type=int, default=None, help='Max parallel processing workers')
+    parser.add_argument('--download-timeout', type=int, default=300, help='Download timeout in seconds')
+    parser.add_argument('--connect-timeout', type=int, default=10, help='Connection timeout in seconds')
+    parser.add_argument('--s3-timeout', type=int, default=300, help='S3 upload timeout in seconds')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='Logging level')
+
+    args = parser.parse_args()
+
+    # Set log level
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+
+    # Create ETL pipeline
+    etl = NodeETL(
+        base_url="https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/",
+        temp_dir=Path(args.temp_dir),
+        monthly_dir=Path(args.monthly_dir),
+        s3_bucket="data-transform-stampede",
+        max_quota_mb=args.quota_mb,
+        max_download_workers=args.download_workers,
+        max_process_workers=args.process_workers,
+        download_timeout=args.download_timeout,
+        connect_timeout=args.connect_timeout,
+        s3_timeout=args.s3_timeout
+    )
+
+    # Run pipeline
+    success = etl.run_etl_pipeline()
+
+    if success:
+        logger.info("ETL pipeline completed successfully")
+        return 0
+    else:
+        logger.error("ETL pipeline failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
