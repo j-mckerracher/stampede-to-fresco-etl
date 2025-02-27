@@ -1,384 +1,327 @@
-import multiprocessing
+"""
+ETL Script for Node Data Processing
+
+This script downloads node data, processes it into monthly files,
+and uploads the results to AWS S3. Features include:
+1. Sequential node processing with parallel internal operations
+2. Disk quota management to stay under 24GB
+3. File versioning
+4. Resumability in case of failure
+5. Optimized performance
+"""
+import concurrent
 import os
-import json
+import sys
 import time
 import shutil
+import logging
+import argparse
 import threading
+import multiprocessing
+from typing import List, Dict
 from pathlib import Path
-from typing import Dict, List, Optional
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin
+import traceback
+import json
+
+import boto3
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-import boto3
-import concurrent.futures
-from dataclasses import dataclass, asdict
-import logging
-from datetime import datetime, timedelta
 import polars as pl
-import gc
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('etl_process.log'),
-        logging.StreamHandler()
+        logging.StreamHandler(),
+        logging.FileHandler('node_etl.log')
     ]
 )
-
 logger = logging.getLogger(__name__)
 
 
-class ActivityMonitor:
-    """Periodically log activity to show the script is still running"""
-
-    def __init__(self, interval_seconds=300):
-        self.interval_seconds = interval_seconds
-        self.last_activity = datetime.now()
-        self.active_nodes = set()
-        self.node_progress = {}  # Track progress for each node
-        self.lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self.monitor_thread = None
-
-    def start(self):
-        """Start the activity monitor in a separate thread"""
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
-        logger.info(f"Activity monitor started (interval: {self.interval_seconds} seconds)")
-
-    def stop(self):
-        """Stop the activity monitor"""
-        if self.monitor_thread:
-            self._stop_event.set()
-            self.monitor_thread.join(timeout=5)
-            logger.info("Activity monitor stopped")
-
-    def update_activity(self, node_name=None, activity_type=None, progress=None):
-        """Update last activity timestamp and optionally record node activity with progress"""
-        with self.lock:
-            self.last_activity = datetime.now()
-            if node_name:
-                self.active_nodes.add((node_name, activity_type or "processing"))
-                if progress is not None:
-                    self.node_progress[node_name] = {
-                        'activity': activity_type,
-                        'progress': progress,
-                        'last_update': datetime.now()
-                    }
-
-    def get_stalled_nodes(self, stall_threshold_seconds=600):
-        """Return nodes that haven't made progress in the specified time"""
-        stalled_nodes = []
-        now = datetime.now()
-        with self.lock:
-            for node, progress_info in self.node_progress.items():
-                time_since_update = (now - progress_info['last_update']).total_seconds()
-                if time_since_update > stall_threshold_seconds:
-                    stalled_nodes.append((node, progress_info['activity'], time_since_update))
-        return stalled_nodes
-
-    def remove_node(self, node_name):
-        """Remove a node from active nodes"""
-        with self.lock:
-            self.active_nodes = {(node, activity) for node, activity in self.active_nodes if node != node_name}
-            if node_name in self.node_progress:
-                del self.node_progress[node_name]
-
-    def _monitor_loop(self):
-        """Background thread that periodically logs activity"""
-        while not self._stop_event.is_set():
-            time.sleep(min(30, self.interval_seconds))  # First check after 30 seconds max
-
-            with self.lock:
-                time_since_last = datetime.now() - self.last_activity
-                active_node_count = len(self.active_nodes)
-
-                # Create a summary of active nodes by activity type
-                activity_summary = {}
-                for node, activity in self.active_nodes:
-                    activity_summary[activity] = activity_summary.get(activity, 0) + 1
-
-                # Check for stalled nodes
-                stalled_nodes = self.get_stalled_nodes()
-                if stalled_nodes:
-                    logger.warning(f"Detected {len(stalled_nodes)} stalled nodes: {stalled_nodes}")
-
-                # Log current activity
-                if time_since_last.total_seconds() > self.interval_seconds:
-                    if active_node_count > 0:
-                        logger.info(
-                            f"Still running - {active_node_count} active nodes - Activity summary: {activity_summary}")
-                    else:
-                        logger.info(
-                            f"Still running - No active nodes - Last activity: {self.last_activity.strftime('%H:%M:%S')}")
-                    self.last_activity = datetime.now()
-
-
 class DownloadProgressTracker:
-    """Track progress of file downloads to detect stalled downloads"""
+    """Track download progress and detect stalled downloads"""
 
-    def __init__(self, url, expected_size_bytes, timeout_seconds=300):
+    def __init__(self, url: str, total_size: int, stall_timeout: int = 300):
         self.url = url
-        self.expected_size_bytes = expected_size_bytes
-        self.timeout_seconds = timeout_seconds
-        self.bytes_downloaded = 0
-        self.last_progress_time = datetime.now()
+        self.total_size = total_size
+        self.bytes_received = 0
+        self.last_received_time = time.time()
+        self.stall_timeout = stall_timeout
         self.is_stalled = False
 
-    def update_progress(self, chunk_size):
-        """Update download progress"""
-        self.bytes_downloaded += chunk_size
-        self.last_progress_time = datetime.now()
+    def update_progress(self, bytes_received: int):
+        """Update progress with newly received bytes"""
+        self.bytes_received += bytes_received
+        self.last_received_time = time.time()
+        self.is_stalled = False
 
-    def check_stalled(self):
-        """Check if download is stalled"""
-        time_since_progress = (datetime.now() - self.last_progress_time).total_seconds()
-        if time_since_progress > self.timeout_seconds:
+    def check_stalled(self) -> bool:
+        """Check if download has stalled (no progress for timeout period)"""
+        if time.time() - self.last_received_time > self.stall_timeout:
             self.is_stalled = True
             return True
         return False
 
-    def get_progress_percentage(self):
-        """Get download progress as percentage"""
-        if self.expected_size_bytes > 0:
-            return (self.bytes_downloaded / self.expected_size_bytes) * 100
-        return 0
-
-
-@dataclass
-class NodeStatus:
-    """Track processing status of a node"""
-    name: str
-    download_complete: bool = False
-    processing_complete: bool = False
-    processing_started: bool = False
-    uploaded: bool = False
-    last_modified: datetime = None
-    size_bytes: int = 0
-    retry_count: int = 0  # Track retry attempts
-
 
 class DiskQuotaManager:
-    """Manage disk space usage to stay under quota"""
+    """Manage disk quota to prevent exceeding limits"""
 
-    def __init__(self, quota_mb: int, safety_buffer_mb: int = 1024):
-        self.quota_mb = quota_mb
-        self.safety_buffer_mb = safety_buffer_mb
-        self.current_usage_mb = 0
-        self._lock = threading.Lock()
-        logger.info(f"DiskQuotaManager initialized with quota: {quota_mb} MB, safety buffer: {safety_buffer_mb} MB")
+    def __init__(self, max_quota_mb: int, temp_dir: Path):
+        self.max_quota_mb = max_quota_mb
+        self.temp_dir = temp_dir
+        self.allocated_mb = 0
+        self.lock = threading.Lock()
+        logger.info(f"DiskQuotaManager initialized with max quota: {max_quota_mb} MB")
 
-    def get_available_space_mb(self) -> int:
-        with self._lock:
-            available_space = self.quota_mb - self.safety_buffer_mb - self.current_usage_mb
-            logger.debug(f"Available space: {available_space} MB")
-            return available_space
+    def get_current_disk_usage(self) -> int:
+        """Get current disk usage of temp directory in MB"""
+        try:
+            if not self.temp_dir.exists():
+                return 0
 
-    def request_space(self, needed_mb: int) -> bool:
-        """Try to allocate space for an operation"""
-        with self._lock:
-            if self.current_usage_mb + needed_mb <= self.quota_mb - self.safety_buffer_mb:
-                self.current_usage_mb += needed_mb
-                logger.info(f"Allocated {needed_mb} MB. Current usage: {self.current_usage_mb} MB")
+            total_size = 0
+            for path in self.temp_dir.glob('**/*'):
+                if path.is_file():
+                    total_size += path.stat().st_size
+
+            return total_size // (1024 * 1024)
+        except Exception as e:
+            logger.error(f"Error calculating disk usage: {e}")
+            # Return a conservative estimate
+            return self.allocated_mb
+
+    def request_space(self, mb_needed: int) -> bool:
+        """Request space allocation, returns True if space is available"""
+        with self.lock:
+            current_usage = self.get_current_disk_usage()
+            if current_usage + mb_needed <= self.max_quota_mb:
+                self.allocated_mb = current_usage + mb_needed
+                logger.debug(f"Space allocated: {mb_needed} MB, Total: {self.allocated_mb}/{self.max_quota_mb} MB")
                 return True
-            logger.warning(f"Failed to allocate {needed_mb} MB. Current usage: {self.current_usage_mb} MB")
-            return False
+            else:
+                logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
+                               f"Current: {current_usage}/{self.max_quota_mb} MB")
+                return False
 
-    def release_space(self, released_mb: int):
-        """Release allocated space after operation"""
-        with self._lock:
-            self.current_usage_mb = max(0, self.current_usage_mb - released_mb)
-            logger.info(f"Released {released_mb} MB. Current usage: {self.current_usage_mb} MB")
+    def release_space(self, mb_to_release: int):
+        """Release allocated space"""
+        with self.lock:
+            self.allocated_mb = max(0, self.allocated_mb - mb_to_release)
+            logger.debug(f"Space released: {mb_to_release} MB, Remaining allocation: {self.allocated_mb} MB")
 
-
-class VersionManager:
-    """Manage versioning of monthly data files"""
-
-    def __init__(self, base_dir: str):
-        self.base_dir = Path(base_dir)
-        self.version_file = self.base_dir / "version_info.json"
-        self._lock = threading.Lock()
-        self.load_version_info()
-        logger.info(f"VersionManager initialized with base directory: {base_dir}")
-
-    def load_version_info(self):
-        if self.version_file.exists():
-            with open(self.version_file) as f:
-                self.version_info = json.load(f)
-            logger.info(f"Loaded version info: {self.version_info}")
-        else:
-            self.version_info = {
-                'current_version': 1,
-                'uploaded_versions': []
-            }
-            self.save_version_info()
-            logger.info("Created new version info file")
-
-    def save_version_info(self):
-        with self._lock:
-            with open(self.version_file, 'w') as f:
-                json.dump(self.version_info, f)
-            logger.debug("Saved version info")
-
-    def get_current_version(self) -> str:
-        version = f"v{self.version_info['current_version']}"
-        logger.debug(f"Current version: {version}")
-        return version
-
-    def increment_version(self):
-        with self._lock:
-            self.version_info['uploaded_versions'].append(
-                self.version_info['current_version']
-            )
-            self.version_info['current_version'] += 1
-            self.save_version_info()
-            logger.info(f"Incremented version to {self.version_info['current_version']}")
+    def recalculate_usage(self):
+        """Recalculate actual disk usage"""
+        with self.lock:
+            actual_usage = self.get_current_disk_usage()
+            logger.info(f"Disk usage recalculated: {actual_usage} MB (was tracking {self.allocated_mb} MB)")
+            self.allocated_mb = actual_usage
 
 
-class ProcessingStateManager:
-    """Manage processing state and recovery"""
+class MonthlyFileManager:
+    """Manage monthly data files with versioning"""
 
-    def __init__(self, base_dir: str):
-        self.base_dir = Path(base_dir)
-        self.state_file = self.base_dir / "processing_state.json"
-        self.node_statuses: Dict[str, NodeStatus] = {}
-        self._lock = threading.Lock()
-        self.load_state()
-        logger.info(f"ProcessingStateManager initialized with base directory: {base_dir}")
+    def __init__(self, monthly_dir: Path, state_file: Path):
+        self.monthly_dir = monthly_dir
+        self.state_file = state_file
+        self.monthly_files = {}  # Format: {'YYYY-MM': {'file_path': Path, 'version': int}}
+        self.current_node = None
+        self.lock = threading.Lock()
 
-    def load_state(self):
+        # Create dirs if they don't exist
+        self.monthly_dir.mkdir(exist_ok=True, parents=True)
+
+        # Load state if it exists
+        self._load_state()
+        logger.info(f"MonthlyFileManager initialized with dir: {monthly_dir}")
+
+    def _load_state(self):
+        """Load processing state from file"""
         if self.state_file.exists():
-            with open(self.state_file) as f:
-                state_dict = json.load(f)
-                self.node_statuses = {
-                    name: NodeStatus(**status)
-                    for name, status in state_dict.items()
-                }
-            logger.info(f"Loaded processing state with {len(self.node_statuses)} nodes")
+            try:
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+
+                if 'monthly_files' in state:
+                    # Convert string paths back to Path objects
+                    for month, data in state['monthly_files'].items():
+                        data['file_path'] = Path(data['file_path'])
+                    self.monthly_files = state['monthly_files']
+
+                if 'current_node' in state:
+                    self.current_node = state['current_node']
+
+                logger.info(f"Loaded state: {len(self.monthly_files)} monthly files, "
+                            f"current node: {self.current_node}")
+            except Exception as e:
+                logger.error(f"Error loading state file: {e}")
+                self.monthly_files = {}
+                self.current_node = None
         else:
-            logger.info("No existing processing state file found")
+            logger.info("No state file found, starting fresh")
 
-    def save_state(self):
-        with self._lock:
-            state_dict = {
-                name: asdict(status)
-                for name, status in self.node_statuses.items()
+    def _save_state(self):
+        """Save processing state to file"""
+        try:
+            # Convert Path objects to strings for JSON serialization
+            serializable_monthly_files = {}
+            for month, data in self.monthly_files.items():
+                serializable_monthly_files[month] = {
+                    'file_path': str(data['file_path']),
+                    'version': data['version']
+                }
+
+            state = {
+                'monthly_files': serializable_monthly_files,
+                'current_node': self.current_node
             }
+
             with open(self.state_file, 'w') as f:
-                json.dump(state_dict, f)
-            logger.debug("Saved processing state")
+                json.dump(state, f, indent=2)
 
-    def update_node_status(self, node_name: str, **kwargs):
-        with self._lock:
-            if node_name not in self.node_statuses:
-                self.node_statuses[node_name] = NodeStatus(name=node_name)
-                logger.info(f"Added new node {node_name} to processing state")
+            logger.debug(f"Saved state to {self.state_file}")
+        except Exception as e:
+            logger.error(f"Error saving state file: {e}")
 
-            status = self.node_statuses[node_name]
-            for key, value in kwargs.items():
-                setattr(status, key, value)
+    def start_node_processing(self, node_name: str) -> bool:
+        """Mark a node as currently being processed"""
+        with self.lock:
+            if self.current_node and self.current_node != node_name:
+                logger.warning(f"Cannot start processing {node_name}, "
+                               f"already processing {self.current_node}")
+                return False
 
-            self.save_state()
-            logger.debug(f"Updated status for node {node_name}: {kwargs}")
+            self.current_node = node_name
+            self._save_state()
+            logger.info(f"Started processing node: {node_name}")
+            return True
 
-    def get_incomplete_nodes(self) -> List[str]:
-        incomplete_nodes = [
-            name for name, status in self.node_statuses.items()
-            if not status.processing_complete or not status.uploaded
-        ]
-        logger.debug(f"Found {len(incomplete_nodes)} incomplete nodes")
-        return incomplete_nodes
+    def finish_node_processing(self, node_name: str):
+        """Mark node processing as complete"""
+        with self.lock:
+            if self.current_node == node_name:
+                self.current_node = None
+                self._save_state()
+                logger.info(f"Finished processing node: {node_name}")
+            else:
+                logger.warning(f"Node {node_name} was not marked as being processed")
 
-    def is_node_processed_and_uploaded(self, node_name: str) -> bool:
-        status = self.node_statuses.get(node_name)
-        if not status:
-            return False
-        return status.processing_complete and status.uploaded
+    def clean_node_data(self, node_name: str):
+        """Remove all data for this node from monthly files"""
+        with self.lock:
+            logger.info(f"Cleaning up data for node: {node_name}")
 
-    def increment_retry_count(self, node_name: str) -> int:
-        """Increment retry count for a node and return the new count"""
-        with self._lock:
-            if node_name not in self.node_statuses:
-                self.node_statuses[node_name] = NodeStatus(name=node_name)
+            # Get all monthly files
+            files_to_update = []
+            for month_data in self.monthly_files.values():
+                files_to_update.append(month_data['file_path'])
 
-            status = self.node_statuses[node_name]
-            status.retry_count += 1
-            self.save_state()
-            return status.retry_count
+            for file_path in files_to_update:
+                if not file_path.exists():
+                    logger.warning(f"Monthly file {file_path} does not exist, skipping cleanup")
+                    continue
+
+                try:
+                    # Read file
+                    df = pl.read_csv(file_path)
+
+                    # Check if this node exists in the file
+                    if 'Host' in df.columns and node_name in df['Host'].unique():
+                        # Filter out rows for this node
+                        logger.info(f"Removing {node_name} data from {file_path}")
+                        df_filtered = df.filter(pl.col('Host') != node_name)
+
+                        # Write back to file
+                        df_filtered.write_csv(file_path)
+                        logger.info(f"Removed {len(df) - len(df_filtered)} rows for {node_name} from {file_path}")
+                except Exception as e:
+                    logger.error(f"Error cleaning node data from {file_path}: {e}")
+
+    def get_monthly_file(self, timestamp: datetime) -> Path:
+        """Get the appropriate monthly file for a timestamp"""
+        month_key = timestamp.strftime('%Y-%m')
+
+        with self.lock:
+            if month_key not in self.monthly_files:
+                version = 1
+                file_path = self.monthly_dir / f"node_data_{month_key}_v{version}.csv"
+                self.monthly_files[month_key] = {
+                    'file_path': file_path,
+                    'version': version
+                }
+                logger.info(f"Created new monthly file entry: {file_path}")
+                self._save_state()
+
+            return self.monthly_files[month_key]['file_path']
+
+    def increment_versions(self) -> Dict[str, Path]:
+        """Increment all file versions, returning dict of old->new paths"""
+        with self.lock:
+            version_mapping = {}
+
+            for month_key, data in self.monthly_files.items():
+                old_path = data['file_path']
+                new_version = data['version'] + 1
+
+                # Create new file path with incremented version
+                new_path = self.monthly_dir / f"node_data_{month_key}_v{new_version}.csv"
+
+                # Update in our tracking dict
+                self.monthly_files[month_key]['file_path'] = new_path
+                self.monthly_files[month_key]['version'] = new_version
+
+                # Add to mapping
+                version_mapping[str(old_path)] = new_path
+
+                logger.info(f"Incremented version for {month_key}: v{new_version}")
+
+            self._save_state()
+            return version_mapping
+
+    def get_all_current_files(self) -> List[Path]:
+        """Get all current monthly files"""
+        with self.lock:
+            return [data['file_path'] for data in self.monthly_files.values()]
 
 
-class MonthlyDataManager:
-    """Manage monthly data files"""
+class NodeDiscoverer:
+    """Discover available nodes from base URL"""
 
-    def __init__(self, base_dir: str, version_manager: VersionManager):
-        self.base_dir = Path(base_dir)
-        self.monthly_data_dir = self.base_dir / "monthly_data"
-        self.monthly_data_dir.mkdir(exist_ok=True)
-        self.version_manager = version_manager
-        self._lock = threading.Lock()
-        logger.info(f"MonthlyDataManager initialized with base directory: {base_dir}")
+    def __init__(self, base_url: str, session: requests.Session, connect_timeout: int = 10):
+        self.base_url = base_url
+        self.session = session
+        self.connect_timeout = connect_timeout
+        logger.info(f"NodeDiscoverer initialized with base URL: {base_url}")
 
-    def get_monthly_file_path(self, year_month: str) -> Path:
-        version = self.version_manager.get_current_version()
-        file_path = self.monthly_data_dir / f"FRESCO_Stampede_ts_{year_month}_{version}.csv"
-        logger.debug(f"Generated monthly file path: {file_path}")
-        return file_path
+    def discover_nodes(self) -> List[str]:
+        """Discover available nodes"""
+        logger.info(f"Discovering nodes from: {self.base_url}")
 
-    def save_node_data(self, node_name: str, node_data: pl.DataFrame) -> List[Path]:
-        """Save data for a single node, partitioned by month"""
-        saved_files = []
+        try:
+            response = self.session.get(self.base_url, timeout=self.connect_timeout)
+            response.raise_for_status()
 
-        # Add a month column for partitioning
-        df_with_month = node_data.with_columns([
-            pl.col('Timestamp').dt.strftime('%Y_%m').alias('month')
-        ])
+            soup = BeautifulSoup(response.text, 'html.parser')
+            links = soup.find_all('a')
 
-        # Group by month
-        monthly_data = {}
-        for month_group in df_with_month.partition_by('month'):
-            if len(month_group) == 0:
-                continue
+            node_names = []
+            for link in links:
+                href = link.get('href', '')
+                # Look for links that match NODE pattern with trailing slash
+                if href.startswith('NODE') and href.endswith('/'):
+                    node_name = href.rstrip('/')
+                    node_names.append(node_name)
 
-            month_key = month_group[0, 'month']  # Get first row's month value
-            monthly_data[month_key] = month_group.drop('month')  # Remove temporary month column
+            logger.info(f"Discovered {len(node_names)} nodes")
+            return node_names
 
-        with self._lock:
-            for year_month, df in monthly_data.items():
-                file_path = self.get_monthly_file_path(year_month)
-
-                # Convert timestamp to string for storage
-                df_to_save = df.with_columns([
-                    pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
-                ])
-
-                if file_path.exists():
-                    existing_df = pl.read_csv(file_path)
-
-                    # Convert existing timestamp to datetime for comparison
-                    existing_df = existing_df.with_columns([
-                        pl.col('Timestamp').str.strptime(pl.Datetime, '%Y-%m-%d %H:%M:%S').alias('Timestamp')
-                    ])
-
-                    # Convert back to string for storage
-                    merged_df = pl.concat([existing_df, df]).unique().with_columns([
-                        pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
-                    ])
-
-                    merged_df.write_csv(file_path)
-                    logger.info(f"Merged {node_name} data into existing file: {file_path}")
-                else:
-                    df_to_save.write_csv(file_path)
-                    logger.info(f"Created new monthly file for {node_name}: {file_path}")
-
-                saved_files.append(file_path)
-
-        return saved_files
-
-    def get_current_monthly_files(self) -> List[Path]:
-        """Get list of all current monthly data files"""
-        return list(self.monthly_data_dir.glob('*.csv'))
+        except Exception as e:
+            logger.error(f"Error discovering nodes: {e}")
+            return []
 
 
 class NodeDataProcessor:
@@ -570,7 +513,14 @@ class NodeDataProcessor:
 
             # Combine all dataframes
             if dfs:
-                result = pl.concat(dfs)
+                # Use thread pool to process dataframes in parallel
+                with ThreadPoolExecutor(max_workers=max(1, multiprocessing.cpu_count() - 1)) as executor:
+                    # No actual parallel work here, but setting up the structure
+                    # for potential future parallelization of data transformations
+                    futures = [executor.submit(lambda df=df: df) for df in dfs]
+                    processed_dfs = [future.result() for future in futures]
+
+                result = pl.concat(processed_dfs)
                 logger.info(f"Successfully processed node data with {len(result)} rows")
                 return result
             else:
@@ -678,7 +628,7 @@ class NodeDownloader:
             success_flags = []
 
             # Create a ThreadPoolExecutor with a specific max_workers value
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 for file_name in required_files:
                     if not file_exists.get(file_name, False):
                         logger.debug(f"Skipping unavailable file: {file_name} for node {node_name}")
@@ -939,597 +889,363 @@ class S3Uploader:
             raise
 
 
-class ETLPipeline:
-    """Main ETL pipeline with per-node processing and immediate uploads"""
+class NodeETL:
+    """Main ETL class to orchestrate node data processing"""
 
-    def __init__(self, base_url: str, base_dir: str, quota_mb: int, bucket_name: str,
-                 max_workers: int = 4, max_retries: int = 3,
-                 activity_monitor_interval: int = 300,
-                 download_timeout: int = 300,
-                 max_node_retries: int = 2,
-                 stall_detection_timeout: int = 600,
-                 socket_timeout: int = 30):
+    def __init__(
+            self,
+            base_url: str,
+            temp_dir: Path,
+            monthly_dir: Path,
+            s3_bucket: str,
+            max_quota_mb: int = 24512,  # 24GB default
+            max_download_workers: int = 3,
+            max_process_workers: int = None,
+            download_timeout: int = 300,
+            connect_timeout: int = 10,
+            s3_timeout: int = 300
+    ):
         self.base_url = base_url
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
-        self.max_retries = max_retries
-        self.max_node_retries = max_node_retries
-        self.stall_detection_timeout = stall_detection_timeout
-        self.socket_timeout = socket_timeout
+        self.temp_dir = temp_dir
+        self.monthly_dir = monthly_dir
+        self.s3_bucket = s3_bucket
 
-        # Set global socket timeout for all operations
-        import socket
-        socket.setdefaulttimeout(socket_timeout)
-        logger.info(f"Set global socket timeout to {socket_timeout} seconds")
+        # Create directories
+        self.temp_dir.mkdir(exist_ok=True, parents=True)
+        self.monthly_dir.mkdir(exist_ok=True, parents=True)
 
-        # Configure session with better connection pooling and timeout settings
+        # State file location
+        self.state_file = self.monthly_dir / 'etl_state.json'
+
+        # Initialize managers
+        self.quota_manager = DiskQuotaManager(max_quota_mb, temp_dir)
+        self.monthly_file_manager = MonthlyFileManager(monthly_dir, self.state_file)
+
+        # Worker settings
+        self.max_download_workers = max_download_workers
+        self.max_process_workers = max_process_workers or max(1, multiprocessing.cpu_count() - 1)
+
+        # Timeout settings
+        self.download_timeout = download_timeout
+        self.connect_timeout = connect_timeout
+        self.s3_timeout = s3_timeout
+
+        # Create session for HTTP requests
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=min(max_workers * 2, 40),  # Cap at reasonable number
-            pool_maxsize=min(max_workers * 4, 80),  # Cap at reasonable number
-            max_retries=max_retries,
-            pool_block=True  # Block when pool is full instead of discarding
+        self.session.headers.update({
+            'User-Agent': 'NodeETL/1.0',
+        })
+
+        # Initialize components
+        self.node_discoverer = NodeDiscoverer(base_url, self.session, connect_timeout)
+        self.node_downloader = NodeDownloader(
+            base_url,
+            temp_dir,
+            self.quota_manager,
+            self.session,
+            max_workers=max_download_workers,
+            download_timeout=download_timeout,
+            connect_timeout=connect_timeout
         )
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
+        self.node_processor = NodeDataProcessor()
+        self.s3_uploader = S3Uploader(s3_bucket, max_retries=3, timeout=s3_timeout)
 
-        self.quota_manager = DiskQuotaManager(quota_mb)
-        self.version_manager = VersionManager(base_dir)
-        self.state_manager = ProcessingStateManager(base_dir)
-        self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
-        self.s3_uploader = S3Uploader(bucket_name, max_retries=max_retries, timeout=download_timeout)
-        self.processor = NodeDataProcessor()
-        self.downloader = NodeDownloader(
-            base_url=base_url,
-            save_dir=self.base_dir,
-            quota_manager=self.quota_manager,
-            session=self.session,
-            max_workers=max_workers,
-            download_timeout=download_timeout
-        )
+        logger.info(f"NodeETL initialized. Temp dir: {temp_dir}, Monthly dir: {monthly_dir}, "
+                    f"S3 bucket: {s3_bucket}, Max quota: {max_quota_mb} MB")
 
-        self.max_workers = max_workers
+    def process_node_data_to_monthly(self, node_data: pl.DataFrame) -> Dict[str, pl.DataFrame]:
+        """Split node data into monthly DataFrames"""
+        if len(node_data) == 0:
+            logger.warning("Empty node data provided for monthly processing")
+            return {}
 
-        # Initialize activity monitor with stall detection
-        self.activity_monitor = ActivityMonitor(interval_seconds=activity_monitor_interval)
-
-        logger.info(f"ETL pipeline initialized with immediate per-node processing and upload. "
-                    f"Max workers: {max_workers}, download timeout: {download_timeout}s, "
-                    f"max node retries: {max_node_retries}")
-
-    def run(self):
-        """Run the ETL pipeline with immediate per-node processing and uploads"""
+        # Group by month
         try:
-            # Start activity monitor
-            self.activity_monitor.start()
-            self.activity_monitor.update_activity(activity_type="initialization")
+            node_data = node_data.with_columns([
+                pl.col('Timestamp').dt.strftime('%Y-%m').alias('month')
+            ])
 
-            # 1. Get list of nodes
-            nodes = self.get_node_list()
-            if not nodes:
-                logger.error("No nodes found. Exiting.")
-                return
+            monthly_groups = {}
+            for month in node_data['month'].unique():
+                month_df = node_data.filter(pl.col('month') == month)
+                monthly_groups[month] = month_df.drop('month')
+                logger.info(f"Split {len(month_df)} rows for month {month}")
 
-            self.activity_monitor.update_activity(activity_type="found_nodes")
+            return monthly_groups
+        except Exception as e:
+            logger.error(f"Error splitting data into monthly groups: {e}")
+            return {}
 
-            # 2. Process nodes with parallel processing
-            total_nodes = len(nodes)
-            logger.info(f"Starting processing of {total_nodes} nodes")
+    def append_to_monthly_files(self, monthly_data: Dict[str, pl.DataFrame]) -> bool:
+        """Append data to appropriate monthly files"""
+        if not monthly_data:
+            logger.warning("No monthly data to append")
+            return False
 
-            # Filter nodes that need processing
-            nodes_to_process = [node for node in nodes
-                                if not self.state_manager.is_node_processed_and_uploaded(node)]
-            logger.info(f"Found {len(nodes_to_process)} nodes that need processing")
-
-            if not nodes_to_process:
-                logger.info("All nodes are already processed. Nothing to do.")
-                return
-
-            # First, validate the data source URL is accessible
+        success = True
+        for month, df in monthly_data.items():
             try:
-                logger.info(f"Validating data source accessibility: {self.base_url}")
-                test_response = self.session.get(self.base_url, timeout=(5, 10))
-                test_response.raise_for_status()
-                logger.info(f"Data source validation succeeded: status {test_response.status_code}")
-            except Exception as e:
-                logger.error(f"Data source validation failed: {e}")
-                logger.error("Cannot proceed with processing as data source is not accessible")
-                return
+                # Parse month string to datetime for the file manager
+                month_date = datetime.strptime(month, '%Y-%m')
 
-            # First try with a single node to validate the pipeline
-            try:
-                first_node = nodes_to_process[0]
-                logger.info(f"Testing pipeline with a single node: {first_node}")
+                # Get the appropriate file for this month
+                file_path = self.monthly_file_manager.get_monthly_file(month_date)
 
-                # Use lower level timeouts for the test
-                self.downloader.download_timeout = 60
-                self.downloader.connect_timeout = 5
+                # Check if file exists and has content
+                if file_path.exists() and file_path.stat().st_size > 0:
+                    # Read existing file
+                    existing_df = pl.read_csv(file_path)
 
-                # Try to process one node with detailed logging
-                success = self.process_test_node(first_node)
+                    # Append new data
+                    combined_df = pl.concat([existing_df, df])
 
-                if not success:
-                    logger.error(f"Test node {first_node} failed processing - pipeline may have issues")
-                    logger.error("Continuing with batch processing but expect failures")
+                    # Write back to file
+                    combined_df.write_csv(file_path)
+                    logger.info(f"Appended {len(df)} rows to existing file {file_path}")
                 else:
-                    logger.info(f"Test node {first_node} processed successfully - pipeline is working")
-
-                # Reset timeouts to normal
-                self.downloader.download_timeout = 300
-                self.downloader.connect_timeout = 10
+                    # Create new file
+                    df.write_csv(file_path)
+                    logger.info(f"Created new monthly file {file_path} with {len(df)} rows")
 
             except Exception as e:
-                logger.error(f"Error testing pipeline with node {first_node}: {e}")
-                logger.error("Continuing with batch processing but expect failures")
+                logger.error(f"Error appending to monthly file for {month}: {e}")
+                success = False
 
-            # Use a smaller batch size to prevent overwhelming the server
-            batch_size = min(self.max_workers, 5)  # Reduced batch size
-            total_nodes_to_process = len(nodes_to_process)
-            processed_count = 0
+        return success
 
-            # Process in batches
-            for i in range(0, total_nodes_to_process, batch_size):
-                batch = nodes_to_process[i:i + batch_size]
-                logger.info(f"Processing batch {i // batch_size + 1} with {len(batch)} nodes")
+    def upload_monthly_files_to_s3(self) -> bool:
+        """Upload all monthly files to S3 with version increment"""
+        logger.info("Starting upload of monthly files to S3")
 
-                # Process current batch in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(batch_size, self.max_workers)) as executor:
-                    future_to_node = {executor.submit(self.process_and_upload_node, node): node
-                                      for node in batch}
-
-                    logger.info(f"Submitted {len(future_to_node)} nodes for processing in current batch")
-                    self.activity_monitor.update_activity(activity_type="submitted_batch")
-
-                    # Track active futures
-                    active_futures = list(future_to_node.keys())
-                    completed_futures = []
-                    start_time = time.time()
-
-                    # Process futures with timeout detection
-                    while active_futures:
-                        # Wait for some futures to complete (with timeout)
-                        done, active_futures = concurrent.futures.wait(
-                            active_futures,
-                            timeout=60,  # Check every minute
-                            return_when=concurrent.futures.FIRST_COMPLETED
-                        )
-
-                        # Process completed futures
-                        for future in done:
-                            node = future_to_node[future]
-                            try:
-                                success = future.result(timeout=10)  # Short timeout to get result
-                                processed_count += 1
-
-                                # Update progress
-                                print_progress(processed_count, total_nodes_to_process,
-                                               prefix='Overall Progress:',
-                                               suffix=f'({processed_count}/{total_nodes_to_process})')
-
-                                if success:
-                                    logger.info(
-                                        f"Successfully processed node {node} ({processed_count}/{total_nodes_to_process})")
-                                else:
-                                    logger.warning(f"Failed to process node {node}")
-
-                                # Update activity monitor
-                                self.activity_monitor.remove_node(node)
-                                completed_futures.append(future)
-
-                            except Exception as e:
-                                logger.error(f"Error getting result for node {node}: {e}")
-                                self.activity_monitor.remove_node(node)
-                                completed_futures.append(future)
-
-                        # Check for stalled futures
-                        elapsed_time = time.time() - start_time
-                        if elapsed_time > self.stall_detection_timeout and active_futures:
-                            stalled_nodes = [future_to_node[f] for f in active_futures]
-                            logger.warning(f"Detected potential stalled tasks for nodes: {stalled_nodes}")
-
-                            # Check with activity monitor
-                            stalled_nodes_info = self.activity_monitor.get_stalled_nodes(self.stall_detection_timeout)
-                            if stalled_nodes_info:
-                                logger.warning(f"Activity monitor confirms stalled nodes: {stalled_nodes_info}")
-
-                                # Cancel stalled tasks (by adding to completed and removing from active)
-                                for future in list(active_futures):
-                                    node = future_to_node[future]
-                                    if any(node == n for n, _, _ in stalled_nodes_info):
-                                        logger.warning(f"Cancelling stalled task for node {node}")
-                                        future.cancel()
-                                        self.activity_monitor.remove_node(node)
-                                        completed_futures.append(future)
-                                        active_futures.remove(future)
-
-                        # If everything is stalled for too long, abort the batch
-                        if (elapsed_time > self.stall_detection_timeout * 2 and
-                                len(active_futures) == len(future_to_node) and
-                                len(completed_futures) == 0):
-                            logger.error(f"Entire batch appears stalled after {elapsed_time:.0f}s. Aborting batch.")
-                            for future in list(active_futures):
-                                future.cancel()
-                            break
-
-                    # Release session connections after each batch
-                    self.session.close()
-                    self.session = requests.Session()
-                    adapter = requests.adapters.HTTPAdapter(
-                        pool_connections=self.max_workers * 2,
-                        pool_maxsize=self.max_workers * 4,
-                        max_retries=self.max_retries,
-                        pool_block=True
-                    )
-                    self.session.mount('http://', adapter)
-                    self.session.mount('https://', adapter)
-
-                    # Force garbage collection between batches
-                    gc.collect()
-
-                logger.info(
-                    f"Completed batch {i // batch_size + 1} - {processed_count}/{total_nodes_to_process} nodes processed")
-
-                # If the batch was completely unsuccessful, adjust parameters for next batch
-                if processed_count == 0 and i > 0:
-                    logger.warning("No successful nodes processed. Adjusting batch size and timeouts.")
-                    batch_size = max(1, batch_size // 2)
-                    self.downloader.download_timeout = max(30, self.downloader.download_timeout // 2)
-                    self.downloader.connect_timeout = max(2, self.downloader.connect_timeout // 2)
-                    logger.info(f"New batch size: {batch_size}, download timeout: {self.downloader.download_timeout}s")
-
-            logger.info(f"Processing completed! Processed {processed_count} nodes.")
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt, shutting down gracefully...")
-        except Exception as e:
-            logger.error(f"Error in ETL pipeline: {e}", exc_info=True)
-        finally:
-            self.activity_monitor.stop()
-            self.session.close()
-
-    def process_test_node(self, node_name: str) -> bool:
-        """Process a single test node with detailed logging"""
-        logger.info(f"TESTING NODE: Beginning detailed test of node {node_name}")
-        start_time = time.time()
-
-        try:
-            # Test direct URL access
-            node_url = urljoin(self.base_url, f"{node_name}/")
-            logger.info(f"TESTING NODE: Accessing node directory {node_url}")
-
-            try:
-                response = self.session.get(node_url, timeout=(5, 10))
-                logger.info(f"TESTING NODE: Response status: {response.status_code}")
-
-                if response.status_code != 200:
-                    logger.error(f"TESTING NODE: Failed to access node directory, status: {response.status_code}")
-                    return False
-
-                # Try to parse HTML
-                soup = BeautifulSoup(response.text, 'html.parser')
-                links = soup.find_all('a')
-                files = [link.text for link in links if not link.text.startswith('/')]
-                logger.info(f"TESTING NODE: Found links: {files}")
-
-            except Exception as e:
-                logger.error(f"TESTING NODE: Error accessing node directory: {e}")
-                return False
-
-            # Test downloading one small file
-            if 'cpu.csv' in files or True:  # Try anyway even if not found in directory listing
-                file_url = urljoin(node_url, 'cpu.csv')
-                logger.info(f"TESTING NODE: Testing download of {file_url}")
-
-                try:
-                    with self.session.get(file_url, stream=True, timeout=(5, 30)) as file_response:
-                        if file_response.status_code != 200:
-                            logger.error(f"TESTING NODE: File download failed, status: {file_response.status_code}")
-                            return False
-
-                        content_length = file_response.headers.get('content-length')
-                        logger.info(f"TESTING NODE: Content length: {content_length}")
-
-                        # Read first chunk
-                        chunk = next(file_response.iter_content(chunk_size=4096), None)
-                        if chunk:
-                            logger.info(f"TESTING NODE: Successfully received first chunk ({len(chunk)} bytes)")
-                        else:
-                            logger.error("TESTING NODE: Failed to receive any data")
-                            return False
-
-                except Exception as e:
-                    logger.error(f"TESTING NODE: Error downloading test file: {e}")
-                    return False
-
-            logger.info(f"TESTING NODE: Manual tests passed, trying actual node processing")
-            success = self.process_and_upload_node(node_name)
-
-            elapsed = time.time() - start_time
-            if success:
-                logger.info(f"TESTING NODE: Successfully processed test node in {elapsed:.1f}s")
-            else:
-                logger.error(f"TESTING NODE: Failed to process test node (took {elapsed:.1f}s)")
-
-            return success
-
-        except Exception as e:
-            logger.error(f"TESTING NODE: Unexpected error in test node processing: {e}")
+        # Get all current monthly files
+        current_files = self.monthly_file_manager.get_all_current_files()
+        if not current_files:
+            logger.warning("No monthly files to upload")
             return False
 
-        except KeyboardInterrupt:
-            logger.info("Received keyboard interrupt, shutting down gracefully...")
-        except Exception as e:
-            logger.error(f"Error in ETL pipeline: {e}", exc_info=True)
-        finally:
-            self.activity_monitor.stop()
-            self.session.close()
+        # Make sure all files exist
+        files_to_upload = [f for f in current_files if f.exists()]
+        if len(files_to_upload) < len(current_files):
+            logger.warning(f"Some monthly files are missing: expected {len(current_files)}, "
+                           f"found {len(files_to_upload)}")
 
-    def get_node_list(self) -> List[str]:
-        """Get list of all nodes from the base URL"""
-        retry_count = 0
-        while retry_count < self.max_retries:
-            try:
-                logging.info(f"Fetching node list from {self.base_url}")
-                # Use timeout to prevent hanging
-                response = self.session.get(self.base_url, timeout=(10, 30))
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, 'html.parser')
-                nodes = [link.text.strip('/') for link in soup.find_all('a') if link.text.startswith('NODE')]
+        if not files_to_upload:
+            logger.warning("No monthly files found for upload")
+            return False
 
-                if not nodes:
-                    logging.warning(f"No nodes found at {self.base_url}, retrying...")
-                    retry_count += 1
-                    time.sleep(2 ** retry_count)
-                    continue
+        # Upload files
+        upload_success = self.s3_uploader.upload_files(files_to_upload)
 
-                logging.info(f"Found {len(nodes)} nodes to process")
-                return nodes
-            except requests.exceptions.Timeout:
-                retry_count += 1
-                logging.warning(f"Timeout getting node list, retry {retry_count}/{self.max_retries}")
-                time.sleep(2 ** retry_count)
-            except requests.exceptions.RequestException as e:
-                retry_count += 1
-                logging.warning(f"Retry {retry_count}/{self.max_retries} getting node list: {e}")
-                time.sleep(2 ** retry_count)
+        if upload_success:
+            logger.info(f"Successfully uploaded {len(files_to_upload)} files to S3")
 
-        logging.error("Failed to fetch node list after max retries")
-        return []
+            # Increment versions for next upload
+            version_mapping = self.monthly_file_manager.increment_versions()
 
-    def process_and_upload_node(self, node_name: str) -> bool:
-        """Process and upload a single node's data, following the sequential steps"""
-        try:
-            # Update activity monitor
-            self.activity_monitor.update_activity(node_name, "starting")
-
-            # Skip if already processed
-            if self.state_manager.is_node_processed_and_uploaded(node_name):
-                logger.info(f"Node {node_name} already processed and uploaded, skipping")
-                self.activity_monitor.remove_node(node_name)
-                return True
-
-            # Check retry count
-            retry_count = self.state_manager.increment_retry_count(node_name)
-            if retry_count > self.max_node_retries:
-                logger.warning(f"Node {node_name} has been retried {retry_count} times, skipping")
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            # 1. Check disk space
-            if self.quota_manager.get_available_space_mb() < 500:  # Minimum 500MB required
-                logger.error(f"Insufficient disk space to process node {node_name}")
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            # 2. Download
-            logger.info(f"Downloading node {node_name}")
-            self.activity_monitor.update_activity(node_name, "downloading", 0)
-
-            # Set a timeout for the entire download phase
-            download_start = time.time()
-            download_timeout = 600  # 10 minutes max for downloads
-
-            download_success = self.downloader.download_node_files(node_name)
-
-            # Check if download timed out
-            if time.time() - download_start > download_timeout:
-                logger.error(f"Download phase for node {node_name} exceeded timeout of {download_timeout}s")
-                self.state_manager.update_node_status(node_name, download_complete=False)
-                node_dir = self.base_dir / node_name
-                if node_dir.exists():
-                    shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            if not download_success:
-                logger.error(f"Failed to download files for node {node_name}")
-                self.state_manager.update_node_status(node_name, download_complete=False)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            self.state_manager.update_node_status(node_name, download_complete=True)
-
-            # 3. Process
-            logger.info(f"Processing node {node_name}")
-            self.activity_monitor.update_activity(node_name, "processing", 50)
-
-            node_dir = self.base_dir / node_name
-            self.state_manager.update_node_status(node_name, processing_started=True)
-
-            # Add file size logging for debugging
-            try:
-                for file_path in node_dir.glob('*.csv'):
-                    file_size_mb = file_path.stat().st_size / (1024 * 1024)
-                    logger.info(f"Processing file {file_path.name} for node {node_name} (size: {file_size_mb:.2f} MB)")
-            except Exception as e:
-                logger.warning(f"Error logging file sizes for {node_name}: {e}")
-
-            # Add timeout for processing phase
-            processing_start = time.time()
-            processing_timeout = 300  # 5 minutes max for processing
-
-            node_df = self.processor.process_node_data(node_dir)
-
-            # Check if processing timed out
-            if time.time() - processing_start > processing_timeout:
-                logger.error(f"Processing phase for node {node_name} exceeded timeout of {processing_timeout}s")
-                self.state_manager.update_node_status(node_name, processing_complete=False)
-                shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            # Log completion of processing
-            self.activity_monitor.update_activity(node_name, "processed_files", 70)
-
-            if node_df.is_empty():
-                logger.warning(f"No data processed for node {node_name}")
-                self.state_manager.update_node_status(node_name, processing_complete=False)
-                shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            # 4. Save to monthly files
-            logger.info(f"Saving node {node_name} data to monthly files")
-            self.activity_monitor.update_activity(node_name, "saving", 80)
-
-            saved_files = self.monthly_data_manager.save_node_data(node_name, node_df)
-            if not saved_files:
-                logger.warning(f"No files saved for node {node_name}")
-                self.state_manager.update_node_status(node_name, processing_complete=False)
-                shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            # 5. Upload to S3
-            logger.info(f"Uploading node {node_name} data to S3")
-            self.activity_monitor.update_activity(node_name, "uploading", 90)
-
-            # Add timeout for upload phase
-            upload_start = time.time()
-            upload_timeout = 300  # 5 minutes max for uploads
-
-            upload_success = self.s3_uploader.upload_files(saved_files)
-
-            # Check if upload timed out
-            if time.time() - upload_start > upload_timeout:
-                logger.error(f"Upload phase for node {node_name} exceeded timeout of {upload_timeout}s")
-                self.state_manager.update_node_status(node_name, uploaded=False)
-                # Don't delete the files so they can be uploaded later
-                shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
-                return False
-
-            if upload_success:
-                self.version_manager.increment_version()
-                self.state_manager.update_node_status(
-                    node_name,
-                    processing_complete=True,
-                    uploaded=True
-                )
-                # Clean up
-                for file_path in saved_files:
+            # Rename files on disk to match new versions
+            for old_path_str, new_path in version_mapping.items():
+                old_path = Path(old_path_str)
+                if old_path.exists():
                     try:
-                        os.remove(file_path)
-                        logger.info(f"Removed file after upload: {file_path}")
+                        shutil.copy2(old_path, new_path)
+                        logger.info(f"Copied {old_path} to {new_path}")
                     except Exception as e:
-                        logger.warning(f"Error removing file {file_path}: {e}")
+                        logger.error(f"Error copying {old_path} to {new_path}: {e}")
+        else:
+            logger.error("Failed to upload monthly files to S3")
 
-                # Clean up node directory
+        return upload_success
+
+    def process_node(self, node_name: str) -> bool:
+        """Process a single node end-to-end"""
+        logger.info(f"Starting end-to-end processing for node: {node_name}")
+
+        # Check if we're already processing this node (resuming after failure)
+        resuming = False
+        if self.monthly_file_manager.current_node == node_name:
+            logger.info(f"Resuming processing for node {node_name}")
+            resuming = True
+
+            # Clean up any partial data for this node
+            self.monthly_file_manager.clean_node_data(node_name)
+
+        # Start processing this node
+        if not resuming:
+            if not self.monthly_file_manager.start_node_processing(node_name):
+                logger.warning(f"Cannot start processing {node_name}, already processing another node")
+                return False
+
+        # Create node directory in temp
+        node_dir = self.temp_dir / node_name
+        node_dir.mkdir(exist_ok=True)
+
+        success = False
+        try:
+            # Download node data
+            download_success = self.node_downloader.download_node_files(node_name)
+            if not download_success:
+                logger.error(f"Failed to download data for node {node_name}")
+                return False
+
+            # Process node data
+            node_df = self.node_processor.process_node_data(node_dir)
+
+            # Check if we got any data
+            if node_df.shape[0] == 0:
+                logger.warning(f"No data processed for node {node_name}")
+                self.monthly_file_manager.finish_node_processing(node_name)
+                return False
+
+            # Split into monthly datasets
+            monthly_data = self.process_node_data_to_monthly(node_df)
+
+            # Append to monthly files
+            if monthly_data:
+                append_success = self.append_to_monthly_files(monthly_data)
+                if not append_success:
+                    logger.error(f"Failed to append {node_name} data to monthly files")
+                    return False
+
+            # Finish processing this node
+            self.monthly_file_manager.finish_node_processing(node_name)
+            success = True
+
+        except Exception as e:
+            logger.error(f"Error processing node {node_name}: {e}")
+            logger.error(traceback.format_exc())
+            success = False
+
+        finally:
+            # Clean up node directory
+            if node_dir.exists():
                 try:
-                    shutil.rmtree(node_dir, ignore_errors=True)
-                    logger.info(f"Successfully processed and uploaded node {node_name}")
+                    shutil.rmtree(node_dir)
+                    logger.info(f"Cleaned up temp directory for node {node_name}")
                 except Exception as e:
-                    logger.warning(f"Error removing node directory {node_dir}: {e}")
+                    logger.error(f"Error cleaning up node directory {node_dir}: {e}")
 
-                # Force garbage collection
-                del node_df
-                gc.collect()
+            # Recalculate disk usage
+            self.quota_manager.recalculate_usage()
 
-                self.activity_monitor.remove_node(node_name)
+        return success
+
+    def process_nodes_sequential(self, node_names: List[str]) -> int:
+        """Process nodes sequentially, returning count of successful nodes"""
+        logger.info(f"Processing {len(node_names)} nodes sequentially")
+
+        # Check if we need to resume an interrupted node first
+        current_node = self.monthly_file_manager.current_node
+        if current_node and current_node in node_names:
+            logger.info(f"Resuming interrupted node {current_node} first")
+
+            # Process the current node first
+            success = self.process_node(current_node)
+
+            # Remove from list if successfully processed
+            if success:
+                node_names = [n for n in node_names if n != current_node]
+
+        successful_nodes = 0
+        failed_nodes = []
+
+        # Process each node sequentially (to fulfill requirement #1)
+        for node in node_names:
+            try:
+                success = self.process_node(node)
+                if success:
+                    successful_nodes += 1
+                    logger.info(f"Successfully processed node: {node}")
+                else:
+                    failed_nodes.append(node)
+                    logger.warning(f"Failed to process node: {node}")
+            except Exception as e:
+                logger.error(f"Exception processing node {node}: {e}")
+                failed_nodes.append(node)
+
+        if failed_nodes:
+            logger.warning(f"Failed to process {len(failed_nodes)} nodes: {failed_nodes}")
+
+        return successful_nodes
+
+    def run_etl_pipeline(self) -> bool:
+        """Run the full ETL pipeline"""
+        logger.info("Starting ETL pipeline")
+
+        try:
+            # Discover nodes
+            nodes = self.node_discoverer.discover_nodes()
+            if not nodes:
+                logger.error("No nodes discovered, aborting pipeline")
+                return False
+
+            logger.info(f"Discovered {len(nodes)} nodes to process")
+
+            # Process nodes sequentially (one at a time)
+            successful_nodes = self.process_nodes_sequential(nodes)
+            logger.info(f"Successfully processed {successful_nodes}/{len(nodes)} nodes")
+
+            # Upload results to S3
+            upload_success = self.upload_monthly_files_to_s3()
+
+            if successful_nodes > 0 and upload_success:
+                logger.info("ETL pipeline completed successfully")
                 return True
             else:
-                logger.error(f"Failed to upload files for node {node_name}")
-                self.state_manager.update_node_status(node_name, processing_complete=True, uploaded=False)
-                shutil.rmtree(node_dir, ignore_errors=True)
-                self.activity_monitor.remove_node(node_name)
+                logger.warning("ETL pipeline completed with issues")
                 return False
 
         except Exception as e:
-            logger.error(f"Error processing node {node_name}: {e}", exc_info=True)
-            self.state_manager.update_node_status(node_name, processing_complete=False)
-            # Clean up node directory if it exists
-            node_dir = self.base_dir / node_name
-            if node_dir.exists():
-                shutil.rmtree(node_dir, ignore_errors=True)
-            self.activity_monitor.remove_node(node_name)
+            logger.error(f"Error in ETL pipeline: {e}")
+            logger.error(traceback.format_exc())
             return False
-
-
-def print_progress(current: int, total: int, prefix: str = '', suffix: str = ''):
-    """Print progress as a percentage with a progress bar"""
-    percent = (current / total) * 100
-    bar_length = 50
-    filled_length = int(bar_length * current // total)
-    bar = '█' * filled_length + '-' * (bar_length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent:.1f}% {suffix}', end='', flush=True)
-    if current == total:
-        print()
-
-
-def get_default_base_dir():
-    """Get platform-appropriate default base directory"""
-    if os.name == 'nt':  # Windows
-        return os.path.join(os.environ.get('TEMP', os.path.expanduser('~')), 'etl_data')
-    else:  # Unix-like systems
-        return '/tmp/etl_data'
 
 
 def main():
     """Main entry point"""
-    base_dir = os.getenv('ETL_BASE_DIR', get_default_base_dir())
-    base_url = 'https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/'
-    quota_mb = int(os.getenv('ETL_QUOTA_MB', '24512'))
-    bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
-    max_workers = int(os.getenv('ETL_MAX_WORKERS', os.cpu_count() or 4))
-    activity_monitor_interval = int(os.getenv('ETL_ACTIVITY_INTERVAL', '300'))
-    download_timeout = int(os.getenv('ETL_DOWNLOAD_TIMEOUT', '300'))
-    max_node_retries = int(os.getenv('ETL_MAX_NODE_RETRIES', '2'))
-    stall_detection_timeout = int(os.getenv('ETL_STALL_DETECTION_TIMEOUT', '600'))
-    socket_timeout = int(os.getenv('ETL_SOCKET_TIMEOUT', '30'))
+    parser = argparse.ArgumentParser(description='ETL Script for Node Data Processing')
+    parser.add_argument('--base-url', type=str, required=True, help='Base URL for node data')
+    parser.add_argument('--temp-dir', type=str, default='./temp', help='Temporary directory for downloads')
+    parser.add_argument('--monthly-dir', type=str, default='./monthly_files', help='Directory for monthly files')
+    parser.add_argument('--s3-bucket', type=str, required=True, help='S3 bucket for uploads')
+    parser.add_argument('--quota-mb', type=int, default=24512, help='Disk quota in MB (default: 24GB)')
+    parser.add_argument('--download-workers', type=int, default=3, help='Max parallel downloads')
+    parser.add_argument('--process-workers', type=int, default=None, help='Max parallel processing workers')
+    parser.add_argument('--download-timeout', type=int, default=300, help='Download timeout in seconds')
+    parser.add_argument('--connect-timeout', type=int, default=10, help='Connection timeout in seconds')
+    parser.add_argument('--s3-timeout', type=int, default=300, help='S3 upload timeout in seconds')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        help='Logging level')
 
-    # Print configuration
-    logger.info(f"ETL Configuration:")
-    logger.info(f"  - Base URL: {base_url}")
-    logger.info(f"  - Base Directory: {base_dir}")
-    logger.info(f"  - Quota: {quota_mb} MB")
-    logger.info(f"  - S3 Bucket: {bucket_name}")
-    logger.info(f"  - Max Workers: {max_workers}")
-    logger.info(f"  - Activity Monitor Interval: {activity_monitor_interval} seconds")
-    logger.info(f"  - Download Timeout: {download_timeout} seconds")
-    logger.info(f"  - Max Node Retries: {max_node_retries}")
-    logger.info(f"  - Stall Detection Timeout: {stall_detection_timeout} seconds")
-    logger.info(f"  - Socket Timeout: {socket_timeout} seconds")
+    args = parser.parse_args()
 
-    # Reduce max_workers if it's extremely high
-    if max_workers > 40:
-        original_workers = max_workers
-        max_workers = 10
-        logger.info(f"Reduced max_workers from {original_workers} to {max_workers} to prevent connection issues")
+    # Set log level
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
 
-    pipeline = ETLPipeline(
-        base_url=base_url,
-        base_dir=base_dir,
-        quota_mb=quota_mb,
-        bucket_name=bucket_name,
-        max_workers=max_workers,
-        activity_monitor_interval=activity_monitor_interval,
-        download_timeout=download_timeout,
-        max_node_retries=max_node_retries,
-        stall_detection_timeout=stall_detection_timeout,
-        socket_timeout=socket_timeout
+    # Create ETL pipeline
+    etl = NodeETL(
+        base_url=args.base_url,
+        temp_dir=Path(args.temp_dir),
+        monthly_dir=Path(args.monthly_dir),
+        s3_bucket=args.s3_bucket,
+        max_quota_mb=args.quota_mb,
+        max_download_workers=args.download_workers,
+        max_process_workers=args.process_workers,
+        download_timeout=args.download_timeout,
+        connect_timeout=args.connect_timeout,
+        s3_timeout=args.s3_timeout
     )
 
-    pipeline.run()
+    # Run pipeline
+    success = etl.run_etl_pipeline()
+
+    if success:
+        logger.info("ETL pipeline completed successfully")
+        return 0
+    else:
+        logger.error("ETL pipeline failed")
+        return 1
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
