@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 ETL Script for Node Data Processing
 
@@ -18,13 +19,15 @@ import logging
 import argparse
 import threading
 import multiprocessing
-from typing import List, Dict
+from typing import List, Dict, Set, Tuple, Optional, Any
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import traceback
 import json
+import re
+
 import boto3
 import requests
 from bs4 import BeautifulSoup
@@ -104,7 +107,7 @@ class DiskQuotaManager:
                 return True
             else:
                 logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
-                               f"Current: {current_usage}/{self.max_quota_mb} MB")
+                              f"Current: {current_usage}/{self.max_quota_mb} MB")
                 return False
 
     def release_space(self, mb_to_release: int):
@@ -122,13 +125,13 @@ class DiskQuotaManager:
 
 
 class MonthlyFileManager:
-    """Manage monthly data files with versioning"""
+    """Manage monthly data files"""
 
     def __init__(self, monthly_dir: Path, state_file: Path):
         self.monthly_dir = monthly_dir
         self.state_file = state_file
-        self.monthly_files = {}  # Format: {'YYYY-MM': {'file_path': Path, 'version': int}}
         self.current_node = None
+        self.monthly_files = {}  # Format: {'YYYY-MM': 'file_path'}
         self.lock = threading.Lock()
 
         # Create dirs if they don't exist
@@ -145,20 +148,11 @@ class MonthlyFileManager:
                 with open(self.state_file, 'r') as f:
                     state = json.load(f)
 
-                if 'monthly_files' in state:
-                    # Convert string paths back to Path objects
-                    for month, data in state['monthly_files'].items():
-                        data['file_path'] = Path(data['file_path'])
-                    self.monthly_files = state['monthly_files']
-
                 if 'current_node' in state:
                     self.current_node = state['current_node']
-
-                logger.info(f"Loaded state: {len(self.monthly_files)} monthly files, "
-                            f"current node: {self.current_node}")
+                    logger.info(f"Loaded state: current node: {self.current_node}")
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
-                self.monthly_files = {}
                 self.current_node = None
         else:
             logger.info("No state file found, starting fresh")
@@ -166,16 +160,7 @@ class MonthlyFileManager:
     def _save_state(self):
         """Save processing state to file"""
         try:
-            # Convert Path objects to strings for JSON serialization
-            serializable_monthly_files = {}
-            for month, data in self.monthly_files.items():
-                serializable_monthly_files[month] = {
-                    'file_path': str(data['file_path']),
-                    'version': data['version']
-                }
-
             state = {
-                'monthly_files': serializable_monthly_files,
                 'current_node': self.current_node
             }
 
@@ -209,17 +194,12 @@ class MonthlyFileManager:
             else:
                 logger.warning(f"Node {node_name} was not marked as being processed")
 
-    def clean_node_data(self, node_name: str):
+    def clean_node_data(self, node_name: str, file_paths: List[Path]):
         """Remove all data for this node from monthly files"""
         with self.lock:
             logger.info(f"Cleaning up data for node: {node_name}")
 
-            # Get all monthly files
-            files_to_update = []
-            for month_data in self.monthly_files.values():
-                files_to_update.append(month_data['file_path'])
-
-            for file_path in files_to_update:
+            for file_path in file_paths:
                 if not file_path.exists():
                     logger.warning(f"Monthly file {file_path} does not exist, skipping cleanup")
                     continue
@@ -240,51 +220,24 @@ class MonthlyFileManager:
                 except Exception as e:
                     logger.error(f"Error cleaning node data from {file_path}: {e}")
 
-    def get_monthly_file(self, timestamp: datetime) -> Path:
-        """Get the appropriate monthly file for a timestamp"""
+    def get_monthly_file_path(self, timestamp: datetime) -> Path:
+        """Get the file path for a timestamp"""
         month_key = timestamp.strftime('%Y-%m')
+        return self.monthly_dir / f"node_data_{month_key}.csv"
 
-        with self.lock:
-            if month_key not in self.monthly_files:
-                version = 1
-                file_path = self.monthly_dir / f"node_data_{month_key}_v{version}.csv"
-                self.monthly_files[month_key] = {
-                    'file_path': file_path,
-                    'version': version
-                }
-                logger.info(f"Created new monthly file entry: {file_path}")
-                self._save_state()
+    def get_monthly_files_for_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
+        """Get mapping of month to file path for all months in the data"""
+        month_file_map = {}
 
-            return self.monthly_files[month_key]['file_path']
+        for month in monthly_data.keys():
+            try:
+                month_date = datetime.strptime(month, '%Y-%m')
+                file_path = self.get_monthly_file_path(month_date)
+                month_file_map[month] = file_path
+            except Exception as e:
+                logger.error(f"Error getting file path for month {month}: {e}")
 
-    def increment_versions(self) -> Dict[str, Path]:
-        """Increment all file versions, returning dict of old->new paths"""
-        with self.lock:
-            version_mapping = {}
-
-            for month_key, data in self.monthly_files.items():
-                old_path = data['file_path']
-                new_version = data['version'] + 1
-
-                # Create new file path with incremented version
-                new_path = self.monthly_dir / f"node_data_{month_key}_v{new_version}.csv"
-
-                # Update in our tracking dict
-                self.monthly_files[month_key]['file_path'] = new_path
-                self.monthly_files[month_key]['version'] = new_version
-
-                # Add to mapping
-                version_mapping[str(old_path)] = new_path
-
-                logger.info(f"Incremented version for {month_key}: v{new_version}")
-
-            self._save_state()
-            return version_mapping
-
-    def get_all_current_files(self) -> List[Path]:
-        """Get all current monthly files"""
-        with self.lock:
-            return [data['file_path'] for data in self.monthly_files.values()]
+        return month_file_map
 
 
 class NodeDiscoverer:
@@ -814,8 +767,8 @@ class NodeDownloader:
                 logger.info(f"Released quota space for failed download: {url}")
 
 
-class S3Uploader:
-    """Handle S3 uploads with retries"""
+class S3Manager:
+    """Handle S3 uploads and downloads with retries"""
 
     def __init__(self, bucket_name: str, max_retries: int = 3, timeout: int = 300,
                  aws_access_key_id: str = None, aws_secret_access_key: str = None):
@@ -888,13 +841,60 @@ class S3Uploader:
         except Exception as e:
             logger.error(f"Failed to authenticate with AWS: {e}")
 
-        logger.info(f"S3Uploader initialized with bucket: {bucket_name}, timeout: {timeout}s")
+        logger.info(f"S3Manager initialized with bucket: {bucket_name}, timeout: {timeout}s")
+
+    def list_files(self, prefix: str = None) -> List[str]:
+        """List files in the S3 bucket, optionally with a prefix"""
+        try:
+            if prefix:
+                response = self.s3_client.list_objects_v2(Bucket=self.bucket_name, Prefix=prefix)
+            else:
+                response = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
+
+            if 'Contents' in response:
+                return [obj['Key'] for obj in response['Contents']]
+            else:
+                return []
+
+        except Exception as e:
+            logger.error(f"Error listing files in S3 bucket {self.bucket_name}: {e}")
+            return []
+
+    def download_file(self, s3_key: str, local_path: Path) -> bool:
+        """Download a file from S3 with retry logic"""
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                logger.info(f"Downloading {s3_key} from S3 bucket {self.bucket_name} to {local_path}")
+
+                # Ensure directory exists
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+
+                self.s3_client.download_file(
+                    self.bucket_name,
+                    s3_key,
+                    str(local_path)
+                )
+
+                logger.info(f"Successfully downloaded {s3_key} to {local_path}")
+                return True
+
+            except Exception as e:
+                retry_count += 1
+                if retry_count == self.max_retries:
+                    logger.error(f"Failed to download {s3_key} after {self.max_retries} attempts: {e}")
+                    return False
+                else:
+                    logger.warning(f"Retry {retry_count}/{self.max_retries} downloading {s3_key}: {e}")
+                    time.sleep(min(30, 2 ** retry_count))
+
+        return False
 
     def upload_files(self, file_paths: List[Path]) -> bool:
         """Upload multiple files to S3 with retry logic"""
         success = True
         self.upload_results = {}  # Clear previous results
-        self.upload_errors = {}  # Clear previous errors
+        self.upload_errors = {}   # Clear previous errors
 
         for file_path in file_paths:
             str_path = str(file_path)  # Use string path as dict key
@@ -958,7 +958,7 @@ class S3Uploader:
 
         # Summarize results
         failed_files = [path for path, result in self.upload_results.items()
-                        if not result.get('success', False)]
+                       if not result.get('success', False)]
 
         if failed_files:
             logger.error(f"Failed to upload {len(failed_files)} files: {failed_files}")
@@ -1017,7 +1017,7 @@ class NodeETL:
             s3_timeout: int = 300,
             aws_access_key_id: str = None,
             aws_secret_access_key: str = None
-    ):
+        ):
         self.base_url = base_url
         self.temp_dir = temp_dir
         self.monthly_dir = monthly_dir
@@ -1061,7 +1061,7 @@ class NodeETL:
             connect_timeout=connect_timeout
         )
         self.node_processor = NodeDataProcessor()
-        self.s3_uploader = S3Uploader(
+        self.s3_manager = S3Manager(
             s3_bucket,
             max_retries=3,
             timeout=s3_timeout,
@@ -1095,91 +1095,114 @@ class NodeETL:
             logger.error(f"Error splitting data into monthly groups: {e}")
             return {}
 
-    def append_to_monthly_files(self, monthly_data: Dict[str, pl.DataFrame]) -> bool:
-        """Append data to appropriate monthly files"""
-        if not monthly_data:
-            logger.warning("No monthly data to append")
-            return False
+    def download_s3_monthly_files(self, months: List[str]) -> Dict[str, Path]:
+        """Download monthly files from S3 for specified months"""
+        logger.info(f"Checking S3 for existing monthly files for months: {months}")
 
-        success = True
+        # List files in the bucket
+        s3_files = self.s3_manager.list_files()
+
+        # Map of month to downloaded file path
+        downloaded_files = {}
+
+        for month in months:
+            # Look for month pattern in S3 files
+            expected_filename = f"node_data_{month}.csv"
+            matching_files = [f for f in s3_files if f == expected_filename]
+
+            if matching_files:
+                s3_key = matching_files[0]
+                local_path = self.monthly_dir / s3_key
+
+                # Download the file
+                if self.s3_manager.download_file(s3_key, local_path):
+                    downloaded_files[month] = local_path
+                    logger.info(f"Downloaded {s3_key} from S3")
+            else:
+                logger.info(f"No existing S3 file found for month {month}")
+
+        return downloaded_files
+
+    def handle_monthly_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
+        """Process monthly data - download from S3 if exists, append, and prepare for upload"""
+        if not monthly_data:
+            logger.warning("No monthly data to handle")
+            return {}
+
+        # Get list of months we have data for
+        months = list(monthly_data.keys())
+
+        # Download existing monthly files from S3
+        s3_monthly_files = self.download_s3_monthly_files(months)
+
+        # Get mapping of month to file path for all months
+        month_file_map = self.monthly_file_manager.get_monthly_files_for_data(monthly_data)
+
+        # Process each month
+        processed_files = {}
+
         for month, df in monthly_data.items():
             try:
-                # Parse month string to datetime for the file manager
-                month_date = datetime.strptime(month, '%Y-%m')
-
-                # Get the appropriate file for this month
-                file_path = self.monthly_file_manager.get_monthly_file(month_date)
-
                 # Convert Timestamp to string format for consistent storage
                 if 'Timestamp' in df.columns:
                     df = df.with_columns([
                         pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
                     ])
 
-                # Check if file exists and has content
-                if file_path.exists() and file_path.stat().st_size > 0:
-                    # Read existing file
-                    existing_df = pl.read_csv(file_path)
+                # Get the file path for this month
+                file_path = month_file_map[month]
 
-                    # Append new data
+                # Check if we downloaded a file from S3
+                if month in s3_monthly_files:
+                    s3_file_path = s3_monthly_files[month]
+
+                    # Read the S3 file
+                    existing_df = pl.read_csv(s3_file_path)
+
+                    # Append our new data
                     combined_df = pl.concat([existing_df, df])
 
-                    # Write back to file
+                    # Write to our local monthly file
                     combined_df.write_csv(file_path)
-                    logger.info(f"Appended {len(df)} rows to existing file {file_path}")
+                    logger.info(f"Appended {len(df)} rows to existing S3 data for month {month}")
+
+                    # Clean up the downloaded S3 file if it's different from our output file
+                    if s3_file_path != file_path and s3_file_path.exists():
+                        os.remove(s3_file_path)
+                        logger.debug(f"Removed downloaded S3 file: {s3_file_path}")
                 else:
-                    # Create new file
-                    df.write_csv(file_path)
-                    logger.info(f"Created new monthly file {file_path} with {len(df)} rows")
+                    # Check if we have a local file to append to
+                    if file_path.exists() and file_path.stat().st_size > 0:
+                        # Read existing file
+                        existing_df = pl.read_csv(file_path)
+
+                        # Append new data
+                        combined_df = pl.concat([existing_df, df])
+
+                        # Write back to file
+                        combined_df.write_csv(file_path)
+                        logger.info(f"Appended {len(df)} rows to existing local file for month {month}")
+                    else:
+                        # Create new file
+                        df.write_csv(file_path)
+                        logger.info(f"Created new monthly file for month {month}")
+
+                # Add to list of processed files
+                processed_files[month] = file_path
 
             except Exception as e:
-                logger.error(f"Error appending to monthly file for {month}: {e}")
-                success = False
+                logger.error(f"Error processing monthly data for {month}: {e}")
 
-        return success
+        return processed_files
 
-    def upload_monthly_files_to_s3(self) -> bool:
-        """Upload all monthly files to S3 with version increment"""
-        logger.info("Starting upload of monthly files to S3")
-
-        # Get all current monthly files
-        current_files = self.monthly_file_manager.get_all_current_files()
-        if not current_files:
+    def upload_monthly_files(self, file_paths: List[Path]) -> bool:
+        """Upload monthly files to S3"""
+        if not file_paths:
             logger.warning("No monthly files to upload")
             return False
 
-        # Make sure all files exist
-        files_to_upload = [f for f in current_files if f.exists()]
-        if len(files_to_upload) < len(current_files):
-            logger.warning(f"Some monthly files are missing: expected {len(current_files)}, "
-                           f"found {len(files_to_upload)}")
-
-        if not files_to_upload:
-            logger.warning("No monthly files found for upload")
-            return False
-
-        # Upload files
-        upload_success = self.s3_uploader.upload_files(files_to_upload)
-
-        if upload_success:
-            logger.info(f"Successfully uploaded {len(files_to_upload)} files to S3")
-
-            # Increment versions for next upload
-            version_mapping = self.monthly_file_manager.increment_versions()
-
-            # Rename files on disk to match new versions
-            for old_path_str, new_path in version_mapping.items():
-                old_path = Path(old_path_str)
-                if old_path.exists():
-                    try:
-                        shutil.copy2(old_path, new_path)
-                        logger.info(f"Copied {old_path} to {new_path}")
-                    except Exception as e:
-                        logger.error(f"Error copying {old_path} to {new_path}: {e}")
-        else:
-            logger.error("Failed to upload monthly files to S3")
-
-        return upload_success
+        logger.info(f"Uploading {len(file_paths)} monthly files to S3")
+        return self.s3_manager.upload_files(file_paths)
 
     def process_node(self, node_name: str) -> bool:
         """Process a single node end-to-end"""
@@ -1190,9 +1213,6 @@ class NodeETL:
         if self.monthly_file_manager.current_node == node_name:
             logger.info(f"Resuming processing for node {node_name}")
             resuming = True
-
-            # Clean up any partial data for this node
-            self.monthly_file_manager.clean_node_data(node_name)
 
         # Start processing this node
         if not resuming:
@@ -1205,6 +1225,8 @@ class NodeETL:
         node_dir.mkdir(exist_ok=True)
 
         success = False
+        processed_files = {}
+
         try:
             # Download node data
             download_success = self.node_downloader.download_node_files(node_name)
@@ -1224,12 +1246,19 @@ class NodeETL:
             # Split into monthly datasets
             monthly_data = self.process_node_data_to_monthly(node_df)
 
-            # Append to monthly files
+            # Handle monthly data - download from S3 if exists, append, prepare for upload
             if monthly_data:
-                append_success = self.append_to_monthly_files(monthly_data)
-                if not append_success:
-                    logger.error(f"Failed to append {node_name} data to monthly files")
-                    return False
+                processed_files = self.handle_monthly_data(monthly_data)
+
+                # Upload to S3
+                if processed_files:
+                    files_to_upload = list(processed_files.values())
+                    upload_success = self.upload_monthly_files(files_to_upload)
+
+                    if not upload_success:
+                        logger.error(f"Failed to upload monthly files for node {node_name}")
+                else:
+                    logger.warning(f"No monthly files processed for node {node_name}")
 
             # Finish processing this node
             self.monthly_file_manager.finish_node_processing(node_name)
@@ -1239,6 +1268,10 @@ class NodeETL:
             logger.error(f"Error processing node {node_name}: {e}")
             logger.error(traceback.format_exc())
             success = False
+
+            # If we have processed files, clean up node data from them
+            if processed_files:
+                self.monthly_file_manager.clean_node_data(node_name, list(processed_files.values()))
 
         finally:
             # Clean up node directory
@@ -1309,10 +1342,7 @@ class NodeETL:
             successful_nodes = self.process_nodes_sequential(nodes)
             logger.info(f"Successfully processed {successful_nodes}/{len(nodes)} nodes")
 
-            # Upload results to S3
-            upload_success = self.upload_monthly_files_to_s3()
-
-            if successful_nodes > 0 and upload_success:
+            if successful_nodes > 0:
                 logger.info("ETL pipeline completed successfully")
                 return True
             else:
@@ -1338,6 +1368,8 @@ def main():
     parser.add_argument('--download-timeout', type=int, default=300, help='Download timeout in seconds')
     parser.add_argument('--connect-timeout', type=int, default=10, help='Connection timeout in seconds')
     parser.add_argument('--s3-timeout', type=int, default=300, help='S3 upload timeout in seconds')
+    parser.add_argument('--aws-access-key-id', type=str, help='AWS Access Key ID')
+    parser.add_argument('--aws-secret-access-key', type=str, help='AWS Secret Access Key')
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                         help='Logging level')
@@ -1358,7 +1390,9 @@ def main():
         max_process_workers=args.process_workers,
         download_timeout=args.download_timeout,
         connect_timeout=args.connect_timeout,
-        s3_timeout=args.s3_timeout
+        s3_timeout=args.s3_timeout,
+        aws_access_key_id=args.aws_access_key_id,
+        aws_secret_access_key=args.aws_secret_access_key
     )
 
     # Run pipeline
