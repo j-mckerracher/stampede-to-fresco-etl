@@ -268,6 +268,95 @@ class MonthlyFileManager:
         """Get all files in the cache directory"""
         return list(self.cache_dir.glob('*.csv'))
 
+    def is_node_processed(self, node_name: str) -> bool:
+        """Check if a node has already been processed"""
+        with self.lock:
+            return node_name in self.processed_nodes
+
+    def start_node_processing(self, node_name: str) -> bool:
+        """Mark a node as currently being processed"""
+        with self.lock:
+            if self.current_node and self.current_node != node_name:
+                logger.warning(f"Cannot start processing {node_name}, "
+                               f"already processing {self.current_node}")
+                return False
+
+            self.current_node = node_name
+            self._save_state()
+            logger.info(f"Started processing node: {node_name}")
+            return True
+
+    def finish_node_processing(self, node_name: str):
+        """Mark node processing as complete"""
+        with self.lock:
+            if self.current_node == node_name:
+                self.current_node = None
+                self.processed_nodes.add(node_name)  # Add to processed nodes
+                self._save_state()
+                logger.info(f"Finished processing node: {node_name}")
+            else:
+                logger.warning(f"Node {node_name} was not marked as being processed")
+
+    def clean_node_data(self, node_name: str, file_paths: List[Path]):
+        """Remove all data for this node from monthly files"""
+        with self.lock:
+            logger.info(f"Cleaning up data for node: {node_name}")
+
+            for file_path in file_paths:
+                if not file_path.exists():
+                    logger.warning(f"Monthly file {file_path} does not exist, skipping cleanup")
+                    continue
+
+                try:
+                    # Read file
+                    df = pl.read_csv(file_path)
+
+                    # Check if this node exists in the file
+                    if 'Host' in df.columns and node_name in df['Host'].unique():
+                        # Filter out rows for this node
+                        logger.info(f"Removing {node_name} data from {file_path}")
+                        df_filtered = df.filter(pl.col('Host') != node_name)
+
+                        # Write back to file
+                        df_filtered.write_csv(file_path)
+                        self.mark_file_modified(file_path)
+                        logger.info(f"Removed {len(df) - len(df_filtered)} rows for {node_name} from {file_path}")
+                except Exception as e:
+                    logger.error(f"Error cleaning node data from {file_path}: {e}")
+
+    def get_monthly_files_for_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
+        """Get mapping of month to file path for all months in the data"""
+        month_file_map = {}
+
+        for month in monthly_data.keys():
+            try:
+                month_date = datetime.strptime(month, '%Y-%m')
+                file_path = self.get_monthly_file_path(month_date)
+                month_file_map[month] = file_path
+            except Exception as e:
+                logger.error(f"Error getting file path for month {month}: {e}")
+
+        return month_file_map
+
+    def mark_file_modified(self, file_path: Path):
+        """Mark a file as modified so it will be uploaded to S3"""
+        with self.lock:
+            self.modified_files.add(str(file_path))
+            self._save_state()
+            logger.debug(f"Marked file as modified: {file_path}")
+
+    def get_modified_files(self) -> List[Path]:
+        """Get list of modified files that need to be uploaded"""
+        with self.lock:
+            return [Path(f) for f in self.modified_files]
+
+    def clear_modified_files(self):
+        """Clear the list of modified files after upload"""
+        with self.lock:
+            self.modified_files.clear()
+            self._save_state()
+            logger.debug("Cleared modified files list")
+
 
 class NodeDiscoverer:
     """Discover available nodes from base URL"""
