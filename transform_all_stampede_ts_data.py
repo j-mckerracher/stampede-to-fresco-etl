@@ -104,7 +104,7 @@ class DiskQuotaManager:
                 return True
             else:
                 logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
-                              f"Current: {current_usage}/{self.max_quota_mb} MB")
+                               f"Current: {current_usage}/{self.max_quota_mb} MB")
                 return False
 
     def release_space(self, mb_to_release: int):
@@ -155,7 +155,7 @@ class MonthlyFileManager:
                     self.current_node = state['current_node']
 
                 logger.info(f"Loaded state: {len(self.monthly_files)} monthly files, "
-                           f"current node: {self.current_node}")
+                            f"current node: {self.current_node}")
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
                 self.monthly_files = {}
@@ -894,7 +894,7 @@ class S3Uploader:
         """Upload multiple files to S3 with retry logic"""
         success = True
         self.upload_results = {}  # Clear previous results
-        self.upload_errors = {}   # Clear previous errors
+        self.upload_errors = {}  # Clear previous errors
 
         for file_path in file_paths:
             str_path = str(file_path)  # Use string path as dict key
@@ -958,7 +958,7 @@ class S3Uploader:
 
         # Summarize results
         failed_files = [path for path, result in self.upload_results.items()
-                       if not result.get('success', False)]
+                        if not result.get('success', False)]
 
         if failed_files:
             logger.error(f"Failed to upload {len(failed_files)} files: {failed_files}")
@@ -1017,7 +1017,7 @@ class NodeETL:
             s3_timeout: int = 300,
             aws_access_key_id: str = None,
             aws_secret_access_key: str = None
-        ):
+    ):
         self.base_url = base_url
         self.temp_dir = temp_dir
         self.monthly_dir = monthly_dir
@@ -1110,6 +1110,12 @@ class NodeETL:
                 # Get the appropriate file for this month
                 file_path = self.monthly_file_manager.get_monthly_file(month_date)
 
+                # Convert Timestamp to string format for consistent storage
+                if 'Timestamp' in df.columns:
+                    df = df.with_columns([
+                        pl.col('Timestamp').dt.strftime('%Y-%m-%d %H:%M:%S').alias('Timestamp')
+                    ])
+
                 # Check if file exists and has content
                 if file_path.exists() and file_path.stat().st_size > 0:
                     # Read existing file
@@ -1146,7 +1152,7 @@ class NodeETL:
         files_to_upload = [f for f in current_files if f.exists()]
         if len(files_to_upload) < len(current_files):
             logger.warning(f"Some monthly files are missing: expected {len(current_files)}, "
-                          f"found {len(files_to_upload)}")
+                           f"found {len(files_to_upload)}")
 
         if not files_to_upload:
             logger.warning("No monthly files found for upload")
