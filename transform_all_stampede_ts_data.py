@@ -819,12 +819,33 @@ class NodeDownloader:
 class S3Uploader:
     """Handle S3 uploads with retries"""
 
-    def __init__(self, bucket_name: str, max_retries: int = 3, timeout: int = 300):
+    def __init__(self, bucket_name: str, max_retries: int = 3, timeout: int = 300,
+                 aws_access_key_id: str = None, aws_secret_access_key: str = None):
         self.bucket_name = bucket_name
         self.max_retries = max_retries
         self.timeout = timeout
+        self.upload_errors = {}  # Track upload errors for reporting
+        self.upload_results = {}  # Track thread results for each file
 
-        # Configure S3 client with timeouts - using botocore Config
+        # Check environment variables for credentials if not provided
+        if aws_access_key_id is None:
+            aws_access_key_id = os.environ.get('AWS_ACCESS_KEY_ID')
+            if aws_access_key_id:
+                logger.debug("Found AWS_ACCESS_KEY_ID in environment variables")
+            else:
+                logger.warning("AWS_ACCESS_KEY_ID not found in environment variables")
+
+        if aws_secret_access_key is None:
+            aws_secret_access_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+            if aws_secret_access_key:
+                logger.debug("Found AWS_SECRET_ACCESS_KEY in environment variables")
+            else:
+                logger.warning("AWS_SECRET_ACCESS_KEY not found in environment variables")
+
+        # Check if we have credentials
+        have_credentials = aws_access_key_id is not None and aws_secret_access_key is not None
+
+        # Configure S3 client with timeouts and credentials
         try:
             from botocore.config import Config
             config = Config(
@@ -832,62 +853,153 @@ class S3Uploader:
                 read_timeout=timeout,
                 retries={'max_attempts': max_retries}
             )
-            self.s3_client = boto3.client('s3', config=config)
-        except (ImportError, AttributeError):
+
+            # Initialize with or without explicit credentials
+            if have_credentials:
+                self.s3_client = boto3.client(
+                    's3',
+                    config=config,
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key
+                )
+                logger.info("Initialized S3 client with explicit credentials")
+            else:
+                self.s3_client = boto3.client('s3', config=config)
+                logger.info("Initialized S3 client with environment credentials")
+
+        except (ImportError, AttributeError) as e:
+            logger.warning(f"Error configuring S3 client: {e}")
+
             # Fallback if Config import fails
-            self.s3_client = boto3.client('s3')
+            if have_credentials:
+                self.s3_client = boto3.client(
+                    's3',
+                    aws_access_key_id=aws_access_key_id,
+                    aws_secret_access_key=aws_secret_access_key
+                )
+            else:
+                self.s3_client = boto3.client('s3')
+
             logger.warning("Could not configure S3 client with timeouts, using default configuration")
+
+        # Test connection
+        try:
+            # Just call a simple API to test credentials
+            self.s3_client.list_buckets()
+            logger.info("Successfully authenticated with AWS")
+        except Exception as e:
+            logger.error(f"Failed to authenticate with AWS: {e}")
 
         logger.info(f"S3Uploader initialized with bucket: {bucket_name}, timeout: {timeout}s")
 
     def upload_files(self, file_paths: List[Path]) -> bool:
+        """Upload multiple files to S3 with retry logic"""
         success = True
+        self.upload_results = {}  # Clear previous results
+        self.upload_errors = {}   # Clear previous errors
+
         for file_path in file_paths:
+            str_path = str(file_path)  # Use string path as dict key
             retry_count = 0
-            while retry_count < self.max_retries:
+            file_success = False
+
+            while retry_count < self.max_retries and not file_success:
                 try:
                     logger.info(f"Uploading {file_path} to S3 bucket {self.bucket_name}")
+
+                    # Create an event to signal when the thread completes
+                    self.upload_results[str_path] = {
+                        'completed': threading.Event(),
+                        'success': False,
+                        'error': None
+                    }
+
                     # Use a thread with timeout to monitor the upload
                     upload_thread = threading.Thread(
                         target=self._upload_file_with_timeout,
-                        args=(file_path,)
+                        args=(file_path, str_path)
                     )
+                    upload_thread.daemon = True  # Mark as daemon to not block program exit
                     upload_thread.start()
-                    upload_thread.join(timeout=self.timeout)
 
-                    if upload_thread.is_alive():
+                    # Wait for thread to complete with timeout
+                    completed = self.upload_results[str_path]['completed'].wait(timeout=self.timeout)
+
+                    if not completed or upload_thread.is_alive():
                         # Upload is taking too long, consider it failed
                         logger.error(f"Upload of {file_path} timed out after {self.timeout}s")
+                        # Store the error
+                        self.upload_errors[str_path] = f"Upload timed out after {self.timeout}s"
                         retry_count += 1
                         # Wait before retrying
                         time.sleep(min(30, 2 ** retry_count))
                         continue
 
-                    logger.info(f"Successfully uploaded {file_path}")
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count == self.max_retries:
-                        logger.error(f"Failed to upload {file_path} after {self.max_retries} attempts: {e}")
-                        success = False
+                    # Check if the thread reported success
+                    if self.upload_results[str_path]['success']:
+                        logger.info(f"Successfully uploaded {file_path}")
+                        file_success = True
+                        break
                     else:
-                        logger.warning(f"Retry {retry_count}/{self.max_retries} uploading {file_path}: {e}")
+                        error = self.upload_results[str_path].get('error', 'Unknown error')
+                        logger.error(f"Upload thread for {file_path} reported failure: {error}")
+                        self.upload_errors[str_path] = error
+                        retry_count += 1
+                        time.sleep(min(30, 2 ** retry_count))
+
+                except Exception as e:
+                    logger.error(f"Exception in upload control for {file_path}: {e}")
+                    self.upload_errors[str_path] = str(e)
+                    retry_count += 1
                     time.sleep(min(30, 2 ** retry_count))
+
+            # After all retries, check if this file was successful
+            if not file_success:
+                logger.error(f"Failed to upload {file_path} after {self.max_retries} attempts")
+                success = False
+
+        # Summarize results
+        failed_files = [path for path, result in self.upload_results.items()
+                       if not result.get('success', False)]
+
+        if failed_files:
+            logger.error(f"Failed to upload {len(failed_files)} files: {failed_files}")
+            success = False
 
         return success
 
-    def _upload_file_with_timeout(self, file_path: Path):
+    def _upload_file_with_timeout(self, file_path: Path, path_key: str):
         """Upload a file to S3, used within a thread with timeout monitoring"""
         try:
+            # Check if file exists and is readable
+            if not file_path.exists():
+                error_msg = f"File {file_path} does not exist"
+                logger.error(error_msg)
+                self.upload_results[path_key]['error'] = error_msg
+                self.upload_results[path_key]['success'] = False
+                self.upload_results[path_key]['completed'].set()
+                return
+
+            # Do the actual upload
             self.s3_client.upload_file(
                 str(file_path),
                 self.bucket_name,
                 file_path.name,
                 ExtraArgs={'ContentType': 'text/csv'}
             )
+
+            # Record success
+            self.upload_results[path_key]['success'] = True
+            self.upload_results[path_key]['completed'].set()
+
         except Exception as e:
-            logger.error(f"Error in threaded upload of {file_path}: {e}")
-            raise
+            error_msg = str(e)
+            logger.error(f"Error in threaded upload of {file_path}: {error_msg}")
+
+            # Record the error
+            self.upload_results[path_key]['error'] = error_msg
+            self.upload_results[path_key]['success'] = False
+            self.upload_results[path_key]['completed'].set()
 
 
 class NodeETL:
@@ -904,7 +1016,9 @@ class NodeETL:
             max_process_workers: int = None,
             download_timeout: int = 300,
             connect_timeout: int = 10,
-            s3_timeout: int = 300
+            s3_timeout: int = 300,
+            aws_access_key_id: str = None,
+            aws_secret_access_key: str = None
         ):
         self.base_url = base_url
         self.temp_dir = temp_dir
@@ -949,7 +1063,13 @@ class NodeETL:
             connect_timeout=connect_timeout
         )
         self.node_processor = NodeDataProcessor()
-        self.s3_uploader = S3Uploader(s3_bucket, max_retries=3, timeout=s3_timeout)
+        self.s3_uploader = S3Uploader(
+            s3_bucket,
+            max_retries=3,
+            timeout=s3_timeout,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key
+        )
 
         logger.info(f"NodeETL initialized. Temp dir: {temp_dir}, Monthly dir: {monthly_dir}, "
                     f"S3 bucket: {s3_bucket}, Max quota: {max_quota_mb} MB")
@@ -1199,54 +1319,3 @@ class NodeETL:
             logger.error(f"Error in ETL pipeline: {e}")
             logger.error(traceback.format_exc())
             return False
-
-
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description='ETL Script for Node Data Processing')
-    parser.add_argument('--base-url', type=str, required=False, help='Base URL for node data')
-    parser.add_argument('--temp-dir', type=str, default='./temp', help='Temporary directory for downloads')
-    parser.add_argument('--monthly-dir', type=str, default='./monthly_files', help='Directory for monthly files')
-    parser.add_argument('--s3-bucket', type=str, required=False, help='S3 bucket for uploads')
-    parser.add_argument('--quota-mb', type=int, default=24512, help='Disk quota in MB (default: 24GB)')
-    parser.add_argument('--download-workers', type=int, default=3, help='Max parallel downloads')
-    parser.add_argument('--process-workers', type=int, default=None, help='Max parallel processing workers')
-    parser.add_argument('--download-timeout', type=int, default=300, help='Download timeout in seconds')
-    parser.add_argument('--connect-timeout', type=int, default=10, help='Connection timeout in seconds')
-    parser.add_argument('--s3-timeout', type=int, default=300, help='S3 upload timeout in seconds')
-    parser.add_argument('--log-level', type=str, default='INFO',
-                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                        help='Logging level')
-
-    args = parser.parse_args()
-
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, args.log_level))
-
-    # Create ETL pipeline
-    etl = NodeETL(
-        base_url="https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/",
-        temp_dir=Path(args.temp_dir),
-        monthly_dir=Path(args.monthly_dir),
-        s3_bucket="data-transform-stampede",
-        max_quota_mb=args.quota_mb,
-        max_download_workers=args.download_workers,
-        max_process_workers=args.process_workers,
-        download_timeout=args.download_timeout,
-        connect_timeout=args.connect_timeout,
-        s3_timeout=args.s3_timeout
-    )
-
-    # Run pipeline
-    success = etl.run_etl_pipeline()
-
-    if success:
-        logger.info("ETL pipeline completed successfully")
-        return 0
-    else:
-        logger.error("ETL pipeline failed")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
