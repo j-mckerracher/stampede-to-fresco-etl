@@ -748,12 +748,21 @@ class S3Uploader:
         self.bucket_name = bucket_name
         self.max_retries = max_retries
         self.timeout = timeout
-        # Configure S3 client with timeouts
-        self.s3_client = boto3.client('s3', config=boto3.config.Config(
-            connect_timeout=30,
-            read_timeout=timeout,
-            retries={'max_attempts': max_retries}
-        ))
+
+        # Configure S3 client with timeouts - using botocore Config
+        try:
+            from botocore.config import Config
+            config = Config(
+                connect_timeout=30,
+                read_timeout=timeout,
+                retries={'max_attempts': max_retries}
+            )
+            self.s3_client = boto3.client('s3', config=config)
+        except (ImportError, AttributeError):
+            # Fallback if Config import fails
+            self.s3_client = boto3.client('s3')
+            logger.warning("Could not configure S3 client with timeouts, using default configuration")
+
         logger.info(f"S3Uploader initialized with bucket: {bucket_name}, timeout: {timeout}s")
 
     def upload_files(self, file_paths: List[Path]) -> bool:
