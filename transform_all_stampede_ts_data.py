@@ -1,15 +1,11 @@
 import multiprocessing
 import os
 import json
-import queue
 import time
 import shutil
 import threading
-from queue import Queue
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
-import pandas as pd
-import numpy as np
+from typing import Dict, List, Optional
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -41,6 +37,7 @@ class ActivityMonitor:
         self.interval_seconds = interval_seconds
         self.last_activity = datetime.now()
         self.active_nodes = set()
+        self.node_progress = {}  # Track progress for each node
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
         self.monitor_thread = None
@@ -58,17 +55,36 @@ class ActivityMonitor:
             self.monitor_thread.join(timeout=5)
             logger.info("Activity monitor stopped")
 
-    def update_activity(self, node_name=None, activity_type=None):
-        """Update last activity timestamp and optionally record node activity"""
+    def update_activity(self, node_name=None, activity_type=None, progress=None):
+        """Update last activity timestamp and optionally record node activity with progress"""
         with self.lock:
             self.last_activity = datetime.now()
             if node_name:
                 self.active_nodes.add((node_name, activity_type or "processing"))
+                if progress is not None:
+                    self.node_progress[node_name] = {
+                        'activity': activity_type,
+                        'progress': progress,
+                        'last_update': datetime.now()
+                    }
+
+    def get_stalled_nodes(self, stall_threshold_seconds=600):
+        """Return nodes that haven't made progress in the specified time"""
+        stalled_nodes = []
+        now = datetime.now()
+        with self.lock:
+            for node, progress_info in self.node_progress.items():
+                time_since_update = (now - progress_info['last_update']).total_seconds()
+                if time_since_update > stall_threshold_seconds:
+                    stalled_nodes.append((node, progress_info['activity'], time_since_update))
+        return stalled_nodes
 
     def remove_node(self, node_name):
         """Remove a node from active nodes"""
         with self.lock:
             self.active_nodes = {(node, activity) for node, activity in self.active_nodes if node != node_name}
+            if node_name in self.node_progress:
+                del self.node_progress[node_name]
 
     def _monitor_loop(self):
         """Background thread that periodically logs activity"""
@@ -84,6 +100,11 @@ class ActivityMonitor:
                 for node, activity in self.active_nodes:
                     activity_summary[activity] = activity_summary.get(activity, 0) + 1
 
+                # Check for stalled nodes
+                stalled_nodes = self.get_stalled_nodes()
+                if stalled_nodes:
+                    logger.warning(f"Detected {len(stalled_nodes)} stalled nodes: {stalled_nodes}")
+
                 # Log current activity
                 if time_since_last.total_seconds() > self.interval_seconds:
                     if active_node_count > 0:
@@ -93,6 +114,37 @@ class ActivityMonitor:
                         logger.info(
                             f"Still running - No active nodes - Last activity: {self.last_activity.strftime('%H:%M:%S')}")
                     self.last_activity = datetime.now()
+
+
+class DownloadProgressTracker:
+    """Track progress of file downloads to detect stalled downloads"""
+
+    def __init__(self, url, expected_size_bytes, timeout_seconds=300):
+        self.url = url
+        self.expected_size_bytes = expected_size_bytes
+        self.timeout_seconds = timeout_seconds
+        self.bytes_downloaded = 0
+        self.last_progress_time = datetime.now()
+        self.is_stalled = False
+
+    def update_progress(self, chunk_size):
+        """Update download progress"""
+        self.bytes_downloaded += chunk_size
+        self.last_progress_time = datetime.now()
+
+    def check_stalled(self):
+        """Check if download is stalled"""
+        time_since_progress = (datetime.now() - self.last_progress_time).total_seconds()
+        if time_since_progress > self.timeout_seconds:
+            self.is_stalled = True
+            return True
+        return False
+
+    def get_progress_percentage(self):
+        """Get download progress as percentage"""
+        if self.expected_size_bytes > 0:
+            return (self.bytes_downloaded / self.expected_size_bytes) * 100
+        return 0
 
 
 @dataclass
@@ -105,6 +157,7 @@ class NodeStatus:
     uploaded: bool = False
     last_modified: datetime = None
     size_bytes: int = 0
+    retry_count: int = 0  # Track retry attempts
 
 
 class DiskQuotaManager:
@@ -243,6 +296,17 @@ class ProcessingStateManager:
         if not status:
             return False
         return status.processing_complete and status.uploaded
+
+    def increment_retry_count(self, node_name: str) -> int:
+        """Increment retry count for a node and return the new count"""
+        with self._lock:
+            if node_name not in self.node_statuses:
+                self.node_statuses[node_name] = NodeStatus(name=node_name)
+
+            status = self.node_statuses[node_name]
+            status.retry_count += 1
+            self.save_state()
+            return status.retry_count
 
 
 class MonthlyDataManager:
@@ -527,14 +591,19 @@ class NodeDownloader:
             save_dir: Path,
             quota_manager: DiskQuotaManager,
             session: requests.Session,
-            max_workers: int = 3
+            max_workers: int = 3,
+            download_timeout: int = 300,  # Added download timeout parameter
+            connect_timeout: int = 10  # Added connect timeout parameter
     ):
         self.base_url = base_url
         self.save_dir = save_dir
         self.quota_manager = quota_manager
         self.max_workers = max_workers or multiprocessing.cpu_count()
         self.session = session
-        logger.info(f"NodeDownloader initialized with base URL: {base_url}, save directory: {save_dir}")
+        self.download_timeout = download_timeout
+        self.connect_timeout = connect_timeout
+        logger.info(f"NodeDownloader initialized with base URL: {base_url}, save directory: {save_dir}, "
+                    f"download timeout: {download_timeout}s, connect timeout: {connect_timeout}s")
 
     def download_node_files(self, node_name: str) -> bool:
         node_dir = self.save_dir / node_name
@@ -545,16 +614,21 @@ class NodeDownloader:
         required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
 
         try:
-            response = self.session.get(node_url)
+            # Use timeout for the initial connection
+            response = self.session.get(node_url, timeout=(self.connect_timeout, self.download_timeout))
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
 
             download_tasks = []
+            success_flags = []
+
+            # Create a ThreadPoolExecutor with a specific max_workers value
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 for file_name in required_files:
                     file_url = urljoin(node_url, file_name)
                     file_path = node_dir / file_name
 
+                    # Submit the download task
                     download_tasks.append(
                         executor.submit(
                             self._download_file,
@@ -563,59 +637,124 @@ class NodeDownloader:
                         )
                     )
 
-                success = all(task.result() for task in download_tasks)
+                # Wait for tasks with timeout
+                for task in download_tasks:
+                    try:
+                        # Add timeout to prevent hanging tasks
+                        result = task.result(timeout=self.download_timeout + 60)  # Add buffer to timeout
+                        success_flags.append(result)
+                    except concurrent.futures.TimeoutError:
+                        logger.error(
+                            f"Download task for node {node_name} timed out after {self.download_timeout + 60}s")
+                        success_flags.append(False)
+                    except Exception as e:
+                        logger.error(f"Download task for node {node_name} failed: {e}")
+                        success_flags.append(False)
+
+            success = all(success_flags)
 
             if not success:
-                shutil.rmtree(node_dir)
+                shutil.rmtree(node_dir, ignore_errors=True)
                 logger.warning(f"Failed to download all files for node {node_name}")
             else:
                 logger.info(f"Successfully downloaded all files for node {node_name}")
 
             return success
 
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout while accessing node URL for {node_name}")
+            if node_dir.exists():
+                shutil.rmtree(node_dir, ignore_errors=True)
+            return False
         except Exception as e:
             logger.error(f"Error downloading {node_name}: {e}")
             if node_dir.exists():
-                shutil.rmtree(node_dir)
+                shutil.rmtree(node_dir, ignore_errors=True)
             return False
 
     def _download_file(self, url: str, file_path: Path) -> bool:
+        progress_tracker = None
         try:
             logger.info(f"Downloading file: {url}")
-            response = self.session.get(url, stream=True)
+
+            # Use timeout for initial connection
+            response = self.session.get(url, stream=True, timeout=(self.connect_timeout, 30))
             response.raise_for_status()
 
             # Get file size and request quota
             file_size = int(response.headers.get('content-length', 0))
-            if not self.quota_manager.request_space(file_size // (1024 * 1024) + 1):
+            if file_size == 0:
+                logger.warning(f"Could not determine file size for {url}")
+
+            # Initialize progress tracker
+            progress_tracker = DownloadProgressTracker(url, file_size, self.download_timeout)
+
+            # Request space
+            if not self.quota_manager.request_space(max(1, file_size // (1024 * 1024))):
                 logger.warning(f"Insufficient space to download {url}")
                 return False
 
             with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                # Use a smaller chunk size for more frequent progress updates
+                for chunk in response.iter_content(chunk_size=4096):
+                    if chunk:
+                        f.write(chunk)
+                        progress_tracker.update_progress(len(chunk))
+
+                        # Check if download is stalled
+                        if progress_tracker.check_stalled():
+                            logger.warning(f"Download stalled for {url} after {self.download_timeout}s")
+                            return False
+
+            # Verify file exists and has content
+            if not file_path.exists() or file_path.stat().st_size == 0:
+                logger.warning(f"Downloaded file {file_path} is empty or does not exist")
+                return False
 
             logger.info(f"Successfully downloaded {url} to {file_path}")
             return True
 
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout downloading {url}")
+            return False
+        except requests.exceptions.ConnectionError:
+            logger.error(f"Connection error downloading {url}")
+            return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error downloading {url}: {e}")
+            return False
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}")
             return False
         finally:
+            # Clean up partial file if download failed
+            if file_path.exists() and (progress_tracker is None or progress_tracker.is_stalled):
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Removed partial download: {file_path}")
+                except Exception as e:
+                    logger.error(f"Error removing partial file {file_path}: {e}")
+
             # Release quota space if download failed
-            if not file_path.exists():
-                self.quota_manager.release_space(file_size // (1024 * 1024) + 1)
+            if not file_path.exists() and file_size > 0:
+                self.quota_manager.release_space(max(1, file_size // (1024 * 1024)))
                 logger.info(f"Released quota space for failed download: {url}")
 
 
 class S3Uploader:
     """Handle S3 uploads with retries"""
 
-    def __init__(self, bucket_name: str, max_retries: int = 3):
+    def __init__(self, bucket_name: str, max_retries: int = 3, timeout: int = 300):
         self.bucket_name = bucket_name
         self.max_retries = max_retries
-        self.s3_client = boto3.client('s3')
-        logger.info(f"S3Uploader initialized with bucket: {bucket_name}")
+        self.timeout = timeout
+        # Configure S3 client with timeouts
+        self.s3_client = boto3.client('s3', config=boto3.config.Config(
+            connect_timeout=30,
+            read_timeout=timeout,
+            retries={'max_attempts': max_retries}
+        ))
+        logger.info(f"S3Uploader initialized with bucket: {bucket_name}, timeout: {timeout}s")
 
     def upload_files(self, file_paths: List[Path]) -> bool:
         success = True
@@ -624,24 +763,47 @@ class S3Uploader:
             while retry_count < self.max_retries:
                 try:
                     logger.info(f"Uploading {file_path} to S3 bucket {self.bucket_name}")
-                    self.s3_client.upload_file(
-                        str(file_path),
-                        self.bucket_name,
-                        file_path.name,
-                        ExtraArgs={'ContentType': 'text/csv'}
+                    # Use a thread with timeout to monitor the upload
+                    upload_thread = threading.Thread(
+                        target=self._upload_file_with_timeout,
+                        args=(file_path,)
                     )
+                    upload_thread.start()
+                    upload_thread.join(timeout=self.timeout)
+
+                    if upload_thread.is_alive():
+                        # Upload is taking too long, consider it failed
+                        logger.error(f"Upload of {file_path} timed out after {self.timeout}s")
+                        retry_count += 1
+                        # Wait before retrying
+                        time.sleep(min(30, 2 ** retry_count))
+                        continue
+
                     logger.info(f"Successfully uploaded {file_path}")
                     break
                 except Exception as e:
                     retry_count += 1
                     if retry_count == self.max_retries:
-                        logger.error(f"Failed to upload {file_path}: {e}")
+                        logger.error(f"Failed to upload {file_path} after {self.max_retries} attempts: {e}")
                         success = False
                     else:
                         logger.warning(f"Retry {retry_count}/{self.max_retries} uploading {file_path}: {e}")
-                    time.sleep(2 ** retry_count)
+                    time.sleep(min(30, 2 ** retry_count))
 
         return success
+
+    def _upload_file_with_timeout(self, file_path: Path):
+        """Upload a file to S3, used within a thread with timeout monitoring"""
+        try:
+            self.s3_client.upload_file(
+                str(file_path),
+                self.bucket_name,
+                file_path.name,
+                ExtraArgs={'ContentType': 'text/csv'}
+            )
+        except Exception as e:
+            logger.error(f"Error in threaded upload of {file_path}: {e}")
+            raise
 
 
 class ETLPipeline:
@@ -649,15 +811,24 @@ class ETLPipeline:
 
     def __init__(self, base_url: str, base_dir: str, quota_mb: int, bucket_name: str,
                  max_workers: int = 4, max_retries: int = 3,
-                 activity_monitor_interval: int = 300):
+                 activity_monitor_interval: int = 300,
+                 download_timeout: int = 300,
+                 max_node_retries: int = 2,
+                 stall_detection_timeout: int = 600):
         self.base_url = base_url
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
         self.max_retries = max_retries
+        self.max_node_retries = max_node_retries
+        self.stall_detection_timeout = stall_detection_timeout
 
+        # Configure session with better connection pooling and timeout settings
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=20, pool_maxsize=20, max_retries=max_retries, pool_block=False
+            pool_connections=max_workers * 2,  # More connections than workers
+            pool_maxsize=max_workers * 4,  # Allow more connections per host
+            max_retries=max_retries,
+            pool_block=True  # Block when pool is full instead of discarding
         )
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
@@ -666,22 +837,25 @@ class ETLPipeline:
         self.version_manager = VersionManager(base_dir)
         self.state_manager = ProcessingStateManager(base_dir)
         self.monthly_data_manager = MonthlyDataManager(base_dir, self.version_manager)
-        self.s3_uploader = S3Uploader(bucket_name)
+        self.s3_uploader = S3Uploader(bucket_name, max_retries=max_retries, timeout=download_timeout)
         self.processor = NodeDataProcessor()
         self.downloader = NodeDownloader(
             base_url=base_url,
             save_dir=self.base_dir,
             quota_manager=self.quota_manager,
             session=self.session,
-            max_workers=max_workers
+            max_workers=max_workers,
+            download_timeout=download_timeout
         )
 
         self.max_workers = max_workers
 
-        # Initialize activity monitor
+        # Initialize activity monitor with stall detection
         self.activity_monitor = ActivityMonitor(interval_seconds=activity_monitor_interval)
 
-        logger.info("ETL pipeline initialized with immediate per-node processing and upload")
+        logger.info(f"ETL pipeline initialized with immediate per-node processing and upload. "
+                    f"Max workers: {max_workers}, download timeout: {download_timeout}s, "
+                    f"max node retries: {max_node_retries}")
 
     def run(self):
         """Run the ETL pipeline with immediate per-node processing and uploads"""
@@ -711,50 +885,108 @@ class ETLPipeline:
                 logger.info("All nodes are already processed. Nothing to do.")
                 return
 
-            # Process nodes in parallel for better efficiency
+            # Process nodes in batches to prevent connection pool exhaustion
+            batch_size = min(self.max_workers, 10)  # Limit batch size
+            total_nodes_to_process = len(nodes_to_process)
             processed_count = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                future_to_node = {executor.submit(self.process_and_upload_node, node): node
-                                  for node in nodes_to_process}
 
-                logger.info(f"Submitted {len(future_to_node)} nodes for processing")
-                self.activity_monitor.update_activity(activity_type="submitted_jobs")
+            # Process in batches
+            for i in range(0, total_nodes_to_process, batch_size):
+                batch = nodes_to_process[i:i + batch_size]
+                logger.info(f"Processing batch {i // batch_size + 1} with {len(batch)} nodes")
 
-                # Periodically log overall status
-                last_status_time = time.time()
+                # Process current batch in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    future_to_node = {executor.submit(self.process_and_upload_node, node): node
+                                      for node in batch}
 
-                for future in concurrent.futures.as_completed(future_to_node):
-                    node = future_to_node[future]
-                    try:
-                        success = future.result()
-                        processed_count += 1
+                    logger.info(f"Submitted {len(future_to_node)} nodes for processing in current batch")
+                    self.activity_monitor.update_activity(activity_type="submitted_batch")
 
-                        # Print progress
-                        print_progress(processed_count, len(future_to_node),
-                                       prefix='Overall Progress:',
-                                       suffix=f'({processed_count}/{len(future_to_node)})')
+                    # Track active futures
+                    active_futures = list(future_to_node.keys())
+                    completed_futures = []
+                    start_time = time.time()
 
-                        # Log progress every 10 nodes or 5 minutes, whichever comes first
-                        current_time = time.time()
-                        if processed_count % 10 == 0 or (current_time - last_status_time) > 300:
-                            logger.info(f"Progress: {processed_count}/{len(future_to_node)} nodes completed")
-                            last_status_time = current_time
+                    # Process futures with timeout detection
+                    while active_futures:
+                        # Wait for some futures to complete (with timeout)
+                        done, active_futures = concurrent.futures.wait(
+                            active_futures,
+                            timeout=60,  # Check every minute
+                            return_when=concurrent.futures.FIRST_COMPLETED
+                        )
 
-                        if success:
-                            logger.info(f"Successfully processed node {node} ({processed_count}/{len(future_to_node)})")
-                        else:
-                            logger.warning(f"Failed to process node {node} ({processed_count}/{len(future_to_node)})")
+                        # Process completed futures
+                        for future in done:
+                            node = future_to_node[future]
+                            try:
+                                success = future.result(timeout=10)  # Short timeout to get result
+                                processed_count += 1
 
-                        # Update activity monitor
-                        self.activity_monitor.remove_node(node)
-                        self.activity_monitor.update_activity(activity_type="completed_node")
+                                # Update progress
+                                print_progress(processed_count, total_nodes_to_process,
+                                               prefix='Overall Progress:',
+                                               suffix=f'({processed_count}/{total_nodes_to_process})')
 
-                    except Exception as e:
-                        logger.error(f"Error processing node {node}: {e}")
-                        self.activity_monitor.remove_node(node)
+                                if success:
+                                    logger.info(
+                                        f"Successfully processed node {node} ({processed_count}/{total_nodes_to_process})")
+                                else:
+                                    logger.warning(f"Failed to process node {node}")
+
+                                # Update activity monitor
+                                self.activity_monitor.remove_node(node)
+                                completed_futures.append(future)
+
+                            except Exception as e:
+                                logger.error(f"Error getting result for node {node}: {e}")
+                                self.activity_monitor.remove_node(node)
+                                completed_futures.append(future)
+
+                        # Check for stalled futures
+                        elapsed_time = time.time() - start_time
+                        if elapsed_time > self.stall_detection_timeout and active_futures:
+                            stalled_nodes = [future_to_node[f] for f in active_futures]
+                            logger.warning(f"Detected potential stalled tasks for nodes: {stalled_nodes}")
+
+                            # Check with activity monitor
+                            stalled_nodes_info = self.activity_monitor.get_stalled_nodes(self.stall_detection_timeout)
+                            if stalled_nodes_info:
+                                logger.warning(f"Activity monitor confirms stalled nodes: {stalled_nodes_info}")
+
+                                # Cancel stalled tasks (by adding to completed and removing from active)
+                                for future in list(active_futures):
+                                    node = future_to_node[future]
+                                    if any(node == n for n, _, _ in stalled_nodes_info):
+                                        logger.warning(f"Cancelling stalled task for node {node}")
+                                        future.cancel()
+                                        self.activity_monitor.remove_node(node)
+                                        completed_futures.append(future)
+                                        active_futures.remove(future)
+
+                    # Release session connections after each batch
+                    self.session.close()
+                    self.session = requests.Session()
+                    adapter = requests.adapters.HTTPAdapter(
+                        pool_connections=self.max_workers * 2,
+                        pool_maxsize=self.max_workers * 4,
+                        max_retries=self.max_retries,
+                        pool_block=True
+                    )
+                    self.session.mount('http://', adapter)
+                    self.session.mount('https://', adapter)
+
+                    # Force garbage collection between batches
+                    gc.collect()
+
+                logger.info(
+                    f"Completed batch {i // batch_size + 1} - {processed_count}/{total_nodes_to_process} nodes processed")
 
             logger.info(f"Processing completed! Processed {processed_count} nodes.")
 
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down gracefully...")
         except Exception as e:
             logger.error(f"Error in ETL pipeline: {e}", exc_info=True)
         finally:
@@ -767,7 +999,8 @@ class ETLPipeline:
         while retry_count < self.max_retries:
             try:
                 logging.info(f"Fetching node list from {self.base_url}")
-                response = self.session.get(self.base_url, timeout=30)
+                # Use timeout to prevent hanging
+                response = self.session.get(self.base_url, timeout=(10, 30))
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, 'html.parser')
                 nodes = [link.text.strip('/') for link in soup.find_all('a') if link.text.startswith('NODE')]
@@ -780,6 +1013,10 @@ class ETLPipeline:
 
                 logging.info(f"Found {len(nodes)} nodes to process")
                 return nodes
+            except requests.exceptions.Timeout:
+                retry_count += 1
+                logging.warning(f"Timeout getting node list, retry {retry_count}/{self.max_retries}")
+                time.sleep(2 ** retry_count)
             except requests.exceptions.RequestException as e:
                 retry_count += 1
                 logging.warning(f"Retry {retry_count}/{self.max_retries} getting node list: {e}")
@@ -800,6 +1037,13 @@ class ETLPipeline:
                 self.activity_monitor.remove_node(node_name)
                 return True
 
+            # Check retry count
+            retry_count = self.state_manager.increment_retry_count(node_name)
+            if retry_count > self.max_node_retries:
+                logger.warning(f"Node {node_name} has been retried {retry_count} times, skipping")
+                self.activity_monitor.remove_node(node_name)
+                return False
+
             # 1. Check disk space
             if self.quota_manager.get_available_space_mb() < 500:  # Minimum 500MB required
                 logger.error(f"Insufficient disk space to process node {node_name}")
@@ -808,9 +1052,25 @@ class ETLPipeline:
 
             # 2. Download
             logger.info(f"Downloading node {node_name}")
-            self.activity_monitor.update_activity(node_name, "downloading")
+            self.activity_monitor.update_activity(node_name, "downloading", 0)
 
-            if not self.downloader.download_node_files(node_name):
+            # Set a timeout for the entire download phase
+            download_start = time.time()
+            download_timeout = 600  # 10 minutes max for downloads
+
+            download_success = self.downloader.download_node_files(node_name)
+
+            # Check if download timed out
+            if time.time() - download_start > download_timeout:
+                logger.error(f"Download phase for node {node_name} exceeded timeout of {download_timeout}s")
+                self.state_manager.update_node_status(node_name, download_complete=False)
+                node_dir = self.base_dir / node_name
+                if node_dir.exists():
+                    shutil.rmtree(node_dir, ignore_errors=True)
+                self.activity_monitor.remove_node(node_name)
+                return False
+
+            if not download_success:
                 logger.error(f"Failed to download files for node {node_name}")
                 self.state_manager.update_node_status(node_name, download_complete=False)
                 self.activity_monitor.remove_node(node_name)
@@ -820,7 +1080,7 @@ class ETLPipeline:
 
             # 3. Process
             logger.info(f"Processing node {node_name}")
-            self.activity_monitor.update_activity(node_name, "processing")
+            self.activity_monitor.update_activity(node_name, "processing", 50)
 
             node_dir = self.base_dir / node_name
             self.state_manager.update_node_status(node_name, processing_started=True)
@@ -833,35 +1093,62 @@ class ETLPipeline:
             except Exception as e:
                 logger.warning(f"Error logging file sizes for {node_name}: {e}")
 
+            # Add timeout for processing phase
+            processing_start = time.time()
+            processing_timeout = 300  # 5 minutes max for processing
+
             node_df = self.processor.process_node_data(node_dir)
 
+            # Check if processing timed out
+            if time.time() - processing_start > processing_timeout:
+                logger.error(f"Processing phase for node {node_name} exceeded timeout of {processing_timeout}s")
+                self.state_manager.update_node_status(node_name, processing_complete=False)
+                shutil.rmtree(node_dir, ignore_errors=True)
+                self.activity_monitor.remove_node(node_name)
+                return False
+
             # Log completion of processing
-            self.activity_monitor.update_activity(node_name, "processed_files")
+            self.activity_monitor.update_activity(node_name, "processed_files", 70)
 
             if node_df.is_empty():
                 logger.warning(f"No data processed for node {node_name}")
                 self.state_manager.update_node_status(node_name, processing_complete=False)
-                shutil.rmtree(node_dir)
+                shutil.rmtree(node_dir, ignore_errors=True)
                 self.activity_monitor.remove_node(node_name)
                 return False
 
             # 4. Save to monthly files
             logger.info(f"Saving node {node_name} data to monthly files")
-            self.activity_monitor.update_activity(node_name, "saving")
+            self.activity_monitor.update_activity(node_name, "saving", 80)
 
             saved_files = self.monthly_data_manager.save_node_data(node_name, node_df)
             if not saved_files:
                 logger.warning(f"No files saved for node {node_name}")
                 self.state_manager.update_node_status(node_name, processing_complete=False)
-                shutil.rmtree(node_dir)
+                shutil.rmtree(node_dir, ignore_errors=True)
                 self.activity_monitor.remove_node(node_name)
                 return False
 
             # 5. Upload to S3
             logger.info(f"Uploading node {node_name} data to S3")
-            self.activity_monitor.update_activity(node_name, "uploading")
+            self.activity_monitor.update_activity(node_name, "uploading", 90)
 
-            if self.s3_uploader.upload_files(saved_files):
+            # Add timeout for upload phase
+            upload_start = time.time()
+            upload_timeout = 300  # 5 minutes max for uploads
+
+            upload_success = self.s3_uploader.upload_files(saved_files)
+
+            # Check if upload timed out
+            if time.time() - upload_start > upload_timeout:
+                logger.error(f"Upload phase for node {node_name} exceeded timeout of {upload_timeout}s")
+                self.state_manager.update_node_status(node_name, uploaded=False)
+                # Don't delete the files so they can be uploaded later
+                shutil.rmtree(node_dir, ignore_errors=True)
+                self.activity_monitor.remove_node(node_name)
+                return False
+
+            if upload_success:
                 self.version_manager.increment_version()
                 self.state_manager.update_node_status(
                     node_name,
@@ -870,12 +1157,18 @@ class ETLPipeline:
                 )
                 # Clean up
                 for file_path in saved_files:
-                    os.remove(file_path)
-                    logger.info(f"Removed file after upload: {file_path}")
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Removed file after upload: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"Error removing file {file_path}: {e}")
 
                 # Clean up node directory
-                shutil.rmtree(node_dir, ignore_errors=True)
-                logger.info(f"Successfully processed and uploaded node {node_name}")
+                try:
+                    shutil.rmtree(node_dir, ignore_errors=True)
+                    logger.info(f"Successfully processed and uploaded node {node_name}")
+                except Exception as e:
+                    logger.warning(f"Error removing node directory {node_dir}: {e}")
 
                 # Force garbage collection
                 del node_df
@@ -928,6 +1221,9 @@ def main():
     bucket_name = os.getenv('ETL_S3_BUCKET', 'data-transform-stampede')
     max_workers = int(os.getenv('ETL_MAX_WORKERS', os.cpu_count() or 4))
     activity_monitor_interval = int(os.getenv('ETL_ACTIVITY_INTERVAL', '300'))
+    download_timeout = int(os.getenv('ETL_DOWNLOAD_TIMEOUT', '300'))
+    max_node_retries = int(os.getenv('ETL_MAX_NODE_RETRIES', '2'))
+    stall_detection_timeout = int(os.getenv('ETL_STALL_DETECTION_TIMEOUT', '600'))
 
     # Print configuration
     logger.info(f"ETL Configuration:")
@@ -937,6 +1233,9 @@ def main():
     logger.info(f"  - S3 Bucket: {bucket_name}")
     logger.info(f"  - Max Workers: {max_workers}")
     logger.info(f"  - Activity Monitor Interval: {activity_monitor_interval} seconds")
+    logger.info(f"  - Download Timeout: {download_timeout} seconds")
+    logger.info(f"  - Max Node Retries: {max_node_retries}")
+    logger.info(f"  - Stall Detection Timeout: {stall_detection_timeout} seconds")
 
     pipeline = ETLPipeline(
         base_url=base_url,
@@ -944,7 +1243,10 @@ def main():
         quota_mb=quota_mb,
         bucket_name=bucket_name,
         max_workers=max_workers,
-        activity_monitor_interval=activity_monitor_interval
+        activity_monitor_interval=activity_monitor_interval,
+        download_timeout=download_timeout,
+        max_node_retries=max_node_retries,
+        stall_detection_timeout=stall_detection_timeout
     )
 
     pipeline.run()
