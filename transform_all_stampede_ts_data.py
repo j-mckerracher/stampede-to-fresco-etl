@@ -1203,10 +1203,10 @@ class NodeETL:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description='ETL Script for Node Data Processing')
-    parser.add_argument('--base-url', type=str, required=True, help='Base URL for node data')
+    parser.add_argument('--base-url', type=str, required=False, help='Base URL for node data')
     parser.add_argument('--temp-dir', type=str, default='./temp', help='Temporary directory for downloads')
     parser.add_argument('--monthly-dir', type=str, default='./monthly_files', help='Directory for monthly files')
-    parser.add_argument('--s3-bucket', type=str, required=True, help='S3 bucket for uploads')
+    parser.add_argument('--s3-bucket', type=str, required=False, help='S3 bucket for uploads')
     parser.add_argument('--quota-mb', type=int, default=24512, help='Disk quota in MB (default: 24GB)')
     parser.add_argument('--download-workers', type=int, default=3, help='Max parallel downloads')
     parser.add_argument('--process-workers', type=int, default=None, help='Max parallel processing workers')
@@ -1224,10 +1224,10 @@ def main():
 
     # Create ETL pipeline
     etl = NodeETL(
-        base_url=args.base_url,
+        base_url="https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/",
         temp_dir=Path(args.temp_dir),
         monthly_dir=Path(args.monthly_dir),
-        s3_bucket=args.s3_bucket,
+        s3_bucket="data-transform-stampede",
         max_quota_mb=args.quota_mb,
         max_download_workers=args.download_workers,
         max_process_workers=args.process_workers,
