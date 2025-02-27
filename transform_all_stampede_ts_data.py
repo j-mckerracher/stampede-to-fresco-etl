@@ -18,13 +18,14 @@ import logging
 import argparse
 import threading
 import multiprocessing
-from typing import List, Dict
+from typing import List, Dict, Set, Tuple, Optional, Any
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 import traceback
 import json
+import re
 
 import boto3
 import requests
@@ -105,7 +106,7 @@ class DiskQuotaManager:
                 return True
             else:
                 logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
-                               f"Current: {current_usage}/{self.max_quota_mb} MB")
+                              f"Current: {current_usage}/{self.max_quota_mb} MB")
                 return False
 
     def release_space(self, mb_to_release: int):
@@ -156,7 +157,7 @@ class MonthlyFileManager:
                     self.current_node = state['current_node']
 
                 logger.info(f"Loaded state: {len(self.monthly_files)} monthly files, "
-                            f"current node: {self.current_node}")
+                           f"current node: {self.current_node}")
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
                 self.monthly_files = {}
@@ -363,7 +364,7 @@ class NodeDataProcessor:
             ])
         except Exception as e:
             logger.error(f"Error processing block file {file_path}: {e}")
-            return pl.DataFrame()
+            return None
 
     def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing CPU file: {file_path}")
@@ -394,7 +395,7 @@ class NodeDataProcessor:
             ])
         except Exception as e:
             logger.error(f"Error processing CPU file {file_path}: {e}")
-            return pl.DataFrame()
+            return None
 
     def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
         logger.info(f"Processing NFS file: {file_path}")
@@ -425,7 +426,7 @@ class NodeDataProcessor:
             ])
         except Exception as e:
             logger.error(f"Error processing NFS file {file_path}: {e}")
-            return pl.DataFrame()
+            return None
 
     def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
         logger.info(f"Processing memory file: {file_path}")
@@ -467,7 +468,7 @@ class NodeDataProcessor:
             return [memused_df, memused_nocache_df]
         except Exception as e:
             logger.error(f"Error processing memory file {file_path}: {e}")
-            return []
+            return None
 
     def process_node_data(self, node_dir: Path) -> pl.DataFrame:
         """Process all files for a node and return combined dataframe"""
@@ -479,7 +480,7 @@ class NodeDataProcessor:
             block_path = node_dir / 'block.csv'
             if block_path.exists() and block_path.stat().st_size > 0:
                 block_df = self.process_block_file(block_path)
-                if block_df and len(block_df) > 0:
+                if isinstance(block_df, pl.DataFrame) and len(block_df) > 0:
                     dfs.append(block_df)
                 # Delete file after processing
                 os.remove(block_path)
@@ -488,7 +489,7 @@ class NodeDataProcessor:
             cpu_path = node_dir / 'cpu.csv'
             if cpu_path.exists() and cpu_path.stat().st_size > 0:
                 cpu_df = self.process_cpu_file(cpu_path)
-                if cpu_df and len(cpu_df) > 0:
+                if isinstance(cpu_df, pl.DataFrame) and len(cpu_df) > 0:
                     dfs.append(cpu_df)
                 # Delete file after processing
                 os.remove(cpu_path)
@@ -497,7 +498,7 @@ class NodeDataProcessor:
             nfs_path = node_dir / 'nfs.csv'
             if nfs_path.exists() and nfs_path.stat().st_size > 0:
                 nfs_df = self.process_nfs_file(nfs_path)
-                if nfs_df and len(nfs_df) > 0:
+                if isinstance(nfs_df, pl.DataFrame) and len(nfs_df) > 0:
                     dfs.append(nfs_df)
                 # Delete file after processing
                 os.remove(nfs_path)
@@ -506,7 +507,7 @@ class NodeDataProcessor:
             mem_path = node_dir / 'mem.csv'
             if mem_path.exists() and mem_path.stat().st_size > 0:
                 memory_dfs = self.process_memory_metrics(mem_path)
-                if memory_dfs:
+                if memory_dfs is not None and len(memory_dfs) > 0:
                     dfs.extend(memory_dfs)
                 # Delete file after processing
                 os.remove(mem_path)
@@ -904,7 +905,7 @@ class NodeETL:
             download_timeout: int = 300,
             connect_timeout: int = 10,
             s3_timeout: int = 300
-    ):
+        ):
         self.base_url = base_url
         self.temp_dir = temp_dir
         self.monthly_dir = monthly_dir
@@ -1027,7 +1028,7 @@ class NodeETL:
         files_to_upload = [f for f in current_files if f.exists()]
         if len(files_to_upload) < len(current_files):
             logger.warning(f"Some monthly files are missing: expected {len(current_files)}, "
-                           f"found {len(files_to_upload)}")
+                          f"found {len(files_to_upload)}")
 
         if not files_to_upload:
             logger.warning("No monthly files found for upload")
@@ -1091,7 +1092,7 @@ class NodeETL:
             node_df = self.node_processor.process_node_data(node_dir)
 
             # Check if we got any data
-            if node_df.shape[0] == 0:
+            if node_df is None or node_df.shape[0] == 0:
                 logger.warning(f"No data processed for node {node_name}")
                 self.monthly_file_manager.finish_node_processing(node_name)
                 return False
