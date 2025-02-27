@@ -577,6 +577,19 @@ class NodeDownloader:
         required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
 
         try:
+            # Check current disk usage before proceeding
+            current_usage = self.quota_manager.get_current_disk_usage()
+            max_quota = self.quota_manager.max_quota_mb
+            available_space = max_quota - current_usage
+            logger.info(f"Current disk usage: {current_usage}/{max_quota} MB, Available: {available_space} MB")
+
+            # Abort if we're already at 95% capacity
+            if available_space < (max_quota * 0.05):
+                logger.error(f"Insufficient disk space available ({available_space} MB) to download node {node_name}")
+                if node_dir.exists():
+                    shutil.rmtree(node_dir, ignore_errors=True)
+                return False
+
             # Use timeout for the initial connection
             logger.debug(f"Attempting to connect to {node_url} with timeout={self.connect_timeout}s")
             start_time = time.time()
@@ -613,18 +626,39 @@ class NodeDownloader:
                     shutil.rmtree(node_dir, ignore_errors=True)
                 return False
 
-            # First check if files actually exist before attempting download
+            # First check if files actually exist and get their sizes
             file_exists = {}
+            file_sizes = {}
+            total_size_mb = 0
+
             for file_name in required_files:
                 file_url = urljoin(node_url, file_name)
                 try:
-                    # Just do a HEAD request to check if file exists
+                    # Do a HEAD request to check if file exists and get its size
                     head_response = self.session.head(file_url, timeout=(5, 10))
                     file_exists[file_name] = head_response.status_code == 200
-                    logger.debug(f"File check: {file_url} - Status: {head_response.status_code}")
+
+                    if file_exists[file_name]:
+                        size_bytes = int(head_response.headers.get('content-length', 0))
+                        size_mb = max(1, size_bytes // (1024 * 1024))
+                        file_sizes[file_name] = size_mb
+                        total_size_mb += size_mb
+                        logger.debug(f"File check: {file_url} - Size: {size_mb} MB")
+                    else:
+                        logger.debug(f"File check: {file_url} - Status: {head_response.status_code} (not available)")
                 except Exception as e:
                     logger.warning(f"Error checking if file exists {file_url}: {e}")
                     file_exists[file_name] = False
+
+            # Check if we have enough space for all files
+            if total_size_mb > 0:
+                logger.info(f"Total size of all files for {node_name}: {total_size_mb} MB")
+                if total_size_mb > available_space:
+                    logger.error(f"Insufficient space to download all files for {node_name} "
+                                 f"(need {total_size_mb} MB, have {available_space} MB)")
+                    if node_dir.exists():
+                        shutil.rmtree(node_dir, ignore_errors=True)
+                    return False
 
             # Log which files we'll be downloading
             available_files = [f for f, exists in file_exists.items() if exists]

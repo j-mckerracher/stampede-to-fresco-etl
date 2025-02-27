@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 S3_BUCKET = 'data-transform-stampede'  # Replace with your bucket name
-NODE_TO_REMOVE = 'NODE1025'  # Replace with the NODE value to remove
+NODE_TO_REMOVE = '104'  # Replace with the NODE value to remove
 AWS_PROFILE = None  # Set to None to use environment variables or default profile, or specify a profile name
 TEMP_DIR = Path(".") / "s3_node_filter"
 
