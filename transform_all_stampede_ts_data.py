@@ -48,7 +48,7 @@ CONFIG = {
     'monthly_dir': './monthly_files',         # Directory for monthly files
     'cache_dir': './cache',                   # Cache directory for monthly files
     's3_bucket': 'data-transform-stampede',   # S3 bucket for uploads
-    'quota_mb': 24512,                        # Disk quota in MB (24GB)
+    'quota_mb': 20000,                        # Disk quota in MB (20GB)
     'download_workers': 4,                    # Max parallel downloads
     'process_workers': None,                  # Max parallel processing workers (None = auto)
     'download_timeout': 300,                  # Download timeout in seconds
@@ -87,31 +87,51 @@ class DownloadProgressTracker:
 
 
 class DiskQuotaManager:
-    """Manage disk quota to prevent exceeding limits"""
+    """Manage disk quota to prevent exceeding limits and enable recovery"""
 
-    def __init__(self, max_quota_mb: int, temp_dir: Path):
+    def __init__(self, max_quota_mb: int, temp_dir: Path, monthly_dir: Path, cache_dir: Path):
         self.max_quota_mb = max_quota_mb
         self.temp_dir = temp_dir
+        self.monthly_dir = monthly_dir
+        self.cache_dir = cache_dir
         self.allocated_mb = 0
         self.lock = threading.Lock()
         logger.info(f"DiskQuotaManager initialized with max quota: {max_quota_mb} MB")
 
     def get_current_disk_usage(self) -> int:
-        """Get current disk usage of temp directory in MB"""
+        """Get current disk usage across all managed directories in MB"""
         try:
-            if not self.temp_dir.exists():
-                return 0
-
             total_size = 0
-            for path in self.temp_dir.glob('**/*'):
-                if path.is_file():
-                    total_size += path.stat().st_size
+
+            # Check temp directory
+            if self.temp_dir.exists():
+                for path in self.temp_dir.glob('**/*'):
+                    if path.is_file():
+                        total_size += path.stat().st_size
+
+            # Check monthly directory
+            if self.monthly_dir.exists():
+                for path in self.monthly_dir.glob('**/*'):
+                    if path.is_file():
+                        total_size += path.stat().st_size
+
+            # Check cache directory
+            if self.cache_dir.exists():
+                for path in self.cache_dir.glob('**/*'):
+                    if path.is_file():
+                        total_size += path.stat().st_size
 
             return total_size // (1024 * 1024)
         except Exception as e:
             logger.error(f"Error calculating disk usage: {e}")
             # Return a conservative estimate
             return self.allocated_mb
+
+    def is_quota_exceeded(self) -> bool:
+        """Check if current usage exceeds or is close to quota limit"""
+        current_usage = self.get_current_disk_usage()
+        # Consider quota exceeded if at 95% or above
+        return current_usage >= (self.max_quota_mb * 0.95)
 
     def request_space(self, mb_needed: int) -> bool:
         """Request space allocation, returns True if space is available"""
@@ -141,7 +161,7 @@ class DiskQuotaManager:
 
 
 class MonthlyFileManager:
-    """Manage monthly data files with improved tracking and caching"""
+    """Manage monthly data files with improved tracking, caching, and versioning"""
 
     def __init__(self, monthly_dir: Path, cache_dir: Path, state_file: Path):
         self.monthly_dir = monthly_dir
@@ -149,8 +169,9 @@ class MonthlyFileManager:
         self.state_file = state_file
         self.current_node = None
         self.processed_nodes = set()  # Track processed nodes
-        self.modified_files = set()   # Track modified files that need to be uploaded
-        self.monthly_files = {}       # Format: {'YYYY-MM': 'file_path'}
+        self.modified_files = set()  # Track modified files that need to be uploaded
+        self.monthly_files = {}  # Format: {'YYYY-MM': 'file_path'}
+        self.version_counter = 0  # File version counter
         self.lock = threading.Lock()
 
         # Create dirs if they don't exist
@@ -159,7 +180,8 @@ class MonthlyFileManager:
 
         # Load state if it exists
         self._load_state()
-        logger.info(f"MonthlyFileManager initialized with dir: {monthly_dir}, cache: {cache_dir}")
+        logger.info(
+            f"MonthlyFileManager initialized with dir: {monthly_dir}, cache: {cache_dir}, version: {self.version_counter}")
         logger.info(f"Loaded {len(self.processed_nodes)} previously processed nodes")
 
     def _load_state(self):
@@ -182,11 +204,17 @@ class MonthlyFileManager:
                 if 'modified_files' in state:
                     self.modified_files = set(state['modified_files'])
                     logger.info(f"Loaded {len(self.modified_files)} modified files from state")
+
+                # Load version counter
+                if 'version_counter' in state:
+                    self.version_counter = state['version_counter']
+                    logger.info(f"Loaded version counter: {self.version_counter}")
             except Exception as e:
                 logger.error(f"Error loading state file: {e}")
                 self.current_node = None
                 self.processed_nodes = set()
                 self.modified_files = set()
+                self.version_counter = 0
         else:
             logger.info("No state file found, starting fresh")
 
@@ -196,7 +224,8 @@ class MonthlyFileManager:
             state = {
                 'current_node': self.current_node,
                 'processed_nodes': list(self.processed_nodes),
-                'modified_files': list(self.modified_files)
+                'modified_files': list(self.modified_files),
+                'version_counter': self.version_counter
             }
 
             with open(self.state_file, 'w') as f:
@@ -206,99 +235,38 @@ class MonthlyFileManager:
         except Exception as e:
             logger.error(f"Error saving state file: {e}")
 
-    def mark_file_modified(self, file_path: Path):
-        """Mark a file as modified so it will be uploaded to S3"""
+    def increment_version(self):
+        """Increment the version counter and update state"""
         with self.lock:
-            self.modified_files.add(str(file_path))
+            self.version_counter += 1
             self._save_state()
-            logger.debug(f"Marked file as modified: {file_path}")
+            logger.info(f"Incremented version counter to {self.version_counter}")
+        return self.version_counter
 
-    def get_modified_files(self) -> List[Path]:
-        """Get list of modified files that need to be uploaded"""
+    def release_current_node(self):
+        """Release the current node without marking it as processed"""
         with self.lock:
-            return [Path(f) for f in self.modified_files]
-
-    def clear_modified_files(self):
-        """Clear the list of modified files after upload"""
-        with self.lock:
-            self.modified_files.clear()
-            self._save_state()
-            logger.debug("Cleared modified files list")
-
-    def is_node_processed(self, node_name: str) -> bool:
-        """Check if a node has already been processed"""
-        with self.lock:
-            return node_name in self.processed_nodes
-
-    def start_node_processing(self, node_name: str) -> bool:
-        """Mark a node as currently being processed"""
-        with self.lock:
-            if self.current_node and self.current_node != node_name:
-                logger.warning(f"Cannot start processing {node_name}, "
-                               f"already processing {self.current_node}")
-                return False
-
-            self.current_node = node_name
-            self._save_state()
-            logger.info(f"Started processing node: {node_name}")
-            return True
-
-    def finish_node_processing(self, node_name: str):
-        """Mark node processing as complete"""
-        with self.lock:
-            if self.current_node == node_name:
+            previous_node = self.current_node
+            if previous_node:
                 self.current_node = None
-                self.processed_nodes.add(node_name)  # Add to processed nodes
                 self._save_state()
-                logger.info(f"Finished processing node: {node_name}")
-            else:
-                logger.warning(f"Node {node_name} was not marked as being processed")
-
-    def clean_node_data(self, node_name: str, file_paths: List[Path]):
-        """Remove all data for this node from monthly files"""
-        with self.lock:
-            logger.info(f"Cleaning up data for node: {node_name}")
-
-            for file_path in file_paths:
-                if not file_path.exists():
-                    logger.warning(f"Monthly file {file_path} does not exist, skipping cleanup")
-                    continue
-
-                try:
-                    # Read file
-                    df = pl.read_csv(file_path)
-
-                    # Check if this node exists in the file
-                    if 'Host' in df.columns and node_name in df['Host'].unique():
-                        # Filter out rows for this node
-                        logger.info(f"Removing {node_name} data from {file_path}")
-                        df_filtered = df.filter(pl.col('Host') != node_name)
-
-                        # Write back to file
-                        df_filtered.write_csv(file_path)
-                        self.mark_file_modified(file_path)
-                        logger.info(f"Removed {len(df) - len(df_filtered)} rows for {node_name} from {file_path}")
-                except Exception as e:
-                    logger.error(f"Error cleaning node data from {file_path}: {e}")
+                logger.info(f"Released current node {previous_node} without marking as processed")
+                return previous_node
+            return None
 
     def get_monthly_file_path(self, timestamp: datetime) -> Path:
-        """Get the file path for a timestamp"""
+        """Get the file path for a timestamp with versioning"""
         month_key = timestamp.strftime('%Y-%m')
-        return self.cache_dir / f"node_data_{month_key}.csv"
 
-    def get_monthly_files_for_data(self, monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path]:
-        """Get mapping of month to file path for all months in the data"""
-        month_file_map = {}
+        # Include version in filename if version_counter > 0
+        if self.version_counter > 0:
+            return self.cache_dir / f"node_data_v{self.version_counter}_{month_key}.csv"
+        else:
+            return self.cache_dir / f"node_data_{month_key}.csv"
 
-        for month in monthly_data.keys():
-            try:
-                month_date = datetime.strptime(month, '%Y-%m')
-                file_path = self.get_monthly_file_path(month_date)
-                month_file_map[month] = file_path
-            except Exception as e:
-                logger.error(f"Error getting file path for month {month}: {e}")
-
-        return month_file_map
+    def get_all_cached_files(self) -> List[Path]:
+        """Get all files in the cache directory"""
+        return list(self.cache_dir.glob('*.csv'))
 
 
 class NodeDiscoverer:
@@ -569,6 +537,7 @@ class NodeDownloader:
                     f"download timeout: {download_timeout}s, connect timeout: {connect_timeout}s")
 
     def download_node_files(self, node_name: str) -> bool:
+        """Download node data files with enhanced disk quota handling"""
         node_dir = self.save_dir / node_name
         node_dir.mkdir(exist_ok=True)
         logger.info(f"Starting download for node: {node_name}")
@@ -673,6 +642,7 @@ class NodeDownloader:
 
             download_tasks = []
             success_flags = []
+            disk_quota_exceeded = False
 
             # Create a ThreadPoolExecutor with a specific max_workers value
             with ThreadPoolExecutor(max_workers=4) as executor:
@@ -718,17 +688,35 @@ class NodeDownloader:
                     except Exception as e:
                         logger.error(f"Download task {i + 1}/{len(download_tasks)} for node {node_name} failed: {e}")
                         success_flags.append(False)
+                        # Check for disk quota exceeded errors
+                        if isinstance(e, OSError) and e.errno == 122:
+                            logger.error(f"Disk quota exceeded during download for node {node_name}")
+                            disk_quota_exceeded = True
+                            break
 
-            success = all(success_flags) and len(success_flags) > 0
-            logger.info(f"Download summary for {node_name}: {sum(success_flags)}/{len(success_flags)} successful")
+                success = all(success_flags) and len(success_flags) > 0
+                logger.info(f"Download summary for {node_name}: {sum(success_flags)}/{len(success_flags)} successful")
 
-            if not success:
-                shutil.rmtree(node_dir, ignore_errors=True)
-                logger.warning(f"Failed to download all files for node {node_name}")
-            else:
-                logger.info(f"Successfully downloaded all files for node {node_name}")
+                if not success:
+                    shutil.rmtree(node_dir, ignore_errors=True)
+                    logger.warning(f"Failed to download all files for node {node_name}")
 
-            return success
+                    # If disk quota was exceeded, propagate this information
+                    if disk_quota_exceeded:
+                        logger.error(f"Download failed due to disk quota exceeded for node {node_name}")
+                        # Clean up any partially downloaded files
+                        for file_name in required_files:
+                            file_path = node_dir / file_name
+                            if file_path.exists():
+                                try:
+                                    os.remove(file_path)
+                                    logger.debug(f"Removed partial file {file_path}")
+                                except Exception as e:
+                                    logger.error(f"Error removing partial file {file_path}: {e}")
+                else:
+                    logger.info(f"Successfully downloaded all files for node {node_name}")
+
+                return success
 
         except requests.exceptions.Timeout:
             logger.error(f"Timeout while accessing node URL for {node_name}")
@@ -742,6 +730,7 @@ class NodeDownloader:
             return False
 
     def _download_file(self, url: str, file_path: Path) -> bool:
+        """Download a single file with enhanced disk quota handling"""
         progress_tracker = None
         file_size = 0
         start_time = time.time()
@@ -789,29 +778,38 @@ class NodeDownloader:
             chunk_count = 0
             last_log_time = time.time()
 
-            with open(file_path, 'wb') as f:
-                # Use a smaller chunk size for more frequent progress updates
-                for chunk in response.iter_content(chunk_size=4096):
-                    if chunk:
-                        f.write(chunk)
-                        bytes_downloaded += len(chunk)
-                        chunk_count += 1
-                        progress_tracker.update_progress(len(chunk))
+            try:
+                with open(file_path, 'wb') as f:
+                    # Use a smaller chunk size for more frequent progress updates
+                    for chunk in response.iter_content(chunk_size=4096):
+                        if chunk:
+                            f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            chunk_count += 1
+                            progress_tracker.update_progress(len(chunk))
 
-                        # Log progress periodically (every 5 seconds)
-                        current_time = time.time()
-                        if current_time - last_log_time > 5:
-                            elapsed = current_time - start_time
-                            progress_pct = (bytes_downloaded / file_size * 100) if file_size > 0 else 0
-                            download_rate = bytes_downloaded / (1024 * elapsed) if elapsed > 0 else 0
-                            logger.debug(f"Download progress for {url}: {bytes_downloaded}/{file_size} bytes "
-                                         f"({progress_pct:.1f}%) at {download_rate:.1f} KB/s, {chunk_count} chunks received")
-                            last_log_time = current_time
+                            # Log progress periodically (every 5 seconds)
+                            current_time = time.time()
+                            if current_time - last_log_time > 5:
+                                elapsed = current_time - start_time
+                                progress_pct = (bytes_downloaded / file_size * 100) if file_size > 0 else 0
+                                download_rate = bytes_downloaded / (1024 * elapsed) if elapsed > 0 else 0
+                                logger.debug(f"Download progress for {url}: {bytes_downloaded}/{file_size} bytes "
+                                             f"({progress_pct:.1f}%) at {download_rate:.1f} KB/s, {chunk_count} chunks received")
+                                last_log_time = current_time
 
-                        # Check if download is stalled
-                        if progress_tracker.check_stalled():
-                            logger.warning(f"Download stalled for {url} after {self.download_timeout}s")
-                            return False
+                            # Check if download is stalled
+                            if progress_tracker.check_stalled():
+                                logger.warning(f"Download stalled for {url} after {self.download_timeout}s")
+                                return False
+            except OSError as e:
+                if e.errno == 122:  # Disk quota exceeded
+                    logger.error(f"Disk quota exceeded while writing file for {url}")
+                    # Propagate the error up so the calling function knows about the disk quota issue
+                    raise
+                else:
+                    logger.error(f"OS error writing file for {url}: {e}")
+                    return False
 
             download_time = time.time() - start_time
             download_rate = bytes_downloaded / (1024 * download_time) if download_time > 0 else 0
@@ -844,6 +842,19 @@ class NodeDownloader:
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error downloading {url}: {e}")
             return False
+        except OSError as e:
+            if e.errno == 122:  # Disk quota exceeded
+                logger.error(f"Disk quota exceeded while downloading {url}")
+                # Release the space allocation we requested
+                if file_size > 0:
+                    space_to_release = max(1, file_size // (1024 * 1024))
+                    self.quota_manager.release_space(space_to_release)
+                    logger.info(f"Released {space_to_release} MB after disk quota error")
+                # Propagate the error up so the calling function knows about the disk quota issue
+                raise
+            else:
+                logger.error(f"OS error downloading {url}: {e}")
+                return False
         except Exception as e:
             logger.error(f"Error downloading {url}: {str(e)}")
             return False
@@ -1105,7 +1116,7 @@ class NodeETL:
             monthly_dir: Path,
             cache_dir: Path,  # New cache directory
             s3_bucket: str,
-            max_quota_mb: int = 24512,  # 24GB default
+            max_quota_mb: int = 20000,  # 20GB default
             max_download_workers: int = 3,
             max_process_workers: int = None,
             download_timeout: int = 300,
@@ -1133,7 +1144,7 @@ class NodeETL:
         self.state_file = self.monthly_dir / 'etl_state.json'
 
         # Initialize managers
-        self.quota_manager = DiskQuotaManager(max_quota_mb, temp_dir)
+        self.quota_manager = DiskQuotaManager(max_quota_mb, temp_dir, monthly_dir, cache_dir)
         self.monthly_file_manager = MonthlyFileManager(monthly_dir, cache_dir, self.state_file)
 
         # Worker settings
@@ -1174,6 +1185,56 @@ class NodeETL:
         logger.info(f"NodeETL initialized. Temp dir: {temp_dir}, Monthly dir: {monthly_dir}, "
                     f"Cache dir: {cache_dir}, S3 bucket: {s3_bucket}, Max quota: {max_quota_mb} MB, "
                     f"Upload batch size: {upload_batch_size}")
+
+    def recover_from_disk_quota_exceeded(self) -> bool:
+        """
+        Handle disk quota exceeded scenario:
+        1. Upload all cached files to S3
+        2. Delete cached files after successful upload
+        3. Increment version counter
+        4. Return success status
+        """
+        logger.info("Attempting to recover from disk quota exceeded")
+
+        # Get all files in cache
+        cached_files = self.monthly_file_manager.get_all_cached_files()
+
+        if not cached_files:
+            logger.warning("No cached files found for recovery")
+            return False
+
+        logger.info(f"Found {len(cached_files)} cached files to upload")
+
+        # Upload all files to S3
+        success = self.s3_manager.upload_files(cached_files)
+
+        if success:
+            logger.info("Successfully uploaded all cached files to S3")
+
+            # Delete all files from cache
+            files_deleted = 0
+            for file_path in cached_files:
+                try:
+                    os.remove(file_path)
+                    files_deleted += 1
+                except Exception as e:
+                    logger.error(f"Error deleting cached file {file_path}: {e}")
+
+            logger.info(f"Deleted {files_deleted}/{len(cached_files)} cached files")
+
+            # Increment version counter
+            self.monthly_file_manager.increment_version()
+
+            # Recalculate disk usage
+            self.quota_manager.recalculate_usage()
+
+            # Clear the modified files list since we've uploaded everything
+            self.monthly_file_manager.clear_modified_files()
+
+            return True
+        else:
+            logger.error("Failed to upload cached files during recovery")
+            return False
 
     def process_node_data_to_monthly(self, node_data: pl.DataFrame) -> Dict[str, pl.DataFrame]:
         """Split node data into monthly DataFrames"""
@@ -1309,7 +1370,7 @@ class NodeETL:
         return success
 
     def process_node(self, node_name: str) -> bool:
-        """Process a single node end-to-end (without immediate S3 upload)"""
+        """Process a single node end-to-end (with disk quota recovery)"""
         logger.info(f"Starting end-to-end processing for node: {node_name}")
 
         # Check if we're already processing this node (resuming after failure)
@@ -1336,11 +1397,29 @@ class NodeETL:
         success = False
         processed_files = {}
 
+        # Check if we have enough disk space before proceeding
+        if self.quota_manager.is_quota_exceeded():
+            logger.warning(f"Disk quota near exceeded before processing node {node_name}, triggering recovery")
+            if not self.recover_from_disk_quota_exceeded():
+                logger.error(f"Failed to recover disk space, cannot process node {node_name}")
+                return False
+
         try:
             # Download node data
             download_success = self.node_downloader.download_node_files(node_name)
+
+            # If download failed due to disk quota, try recovery and retry
+            if not download_success:
+                if self.quota_manager.is_quota_exceeded():
+                    logger.warning(f"Download failed due to disk quota, attempting recovery")
+                    if self.recover_from_disk_quota_exceeded():
+                        logger.info(f"Recovery successful, retrying download for node {node_name}")
+                        # Retry download after recovery
+                        download_success = self.node_downloader.download_node_files(node_name)
+
             if not download_success:
                 logger.error(f"Failed to download data for node {node_name}")
+                self.monthly_file_manager.release_current_node()  # Release without marking as processed
                 return False
 
             # Process node data
@@ -1415,7 +1494,7 @@ class NodeETL:
 
         # Filter out already processed nodes
         nodes_to_process = [node for node in sorted_nodes
-                           if not self.monthly_file_manager.is_node_processed(node)]
+                            if not self.monthly_file_manager.is_node_processed(node)]
 
         logger.info(f"Processing {len(nodes_to_process)} nodes after filtering already processed nodes")
 
@@ -1434,22 +1513,44 @@ class NodeETL:
         successful_nodes = 0
         failed_nodes = []
         nodes_since_upload = 0
+        retry_nodes = []  # Track nodes that failed due to disk quota for retry
 
         # Process each node sequentially
         for node in nodes_to_process:
             try:
+                # Check if we need to recover disk space before processing this node
+                if self.quota_manager.is_quota_exceeded():
+                    logger.warning(f"Disk quota exceeded before processing node {node}, triggering recovery")
+                    if not self.recover_from_disk_quota_exceeded():
+                        logger.error("Failed to recover disk space, skipping node")
+                        failed_nodes.append(node)
+                        continue
+
                 success = self.process_node(node)
                 if success:
                     successful_nodes += 1
                     nodes_since_upload += 1
                     logger.info(f"Successfully processed node: {node}")
                 else:
-                    failed_nodes.append(node)
-                    logger.warning(f"Failed to process node: {node}")
+                    # Check if failure was due to disk quota
+                    if self.quota_manager.is_quota_exceeded():
+                        logger.warning(
+                            f"Node {node} processing may have failed due to disk quota, will retry after recovery")
+                        retry_nodes.append(node)
+
+                        # Attempt recovery
+                        if self.recover_from_disk_quota_exceeded():
+                            logger.info("Successfully recovered disk space")
+                        else:
+                            logger.error("Failed to recover disk space")
+                    else:
+                        failed_nodes.append(node)
+                        logger.warning(f"Failed to process node: {node}")
 
                 # Upload to S3 in batches
                 if nodes_since_upload >= self.upload_batch_size:
-                    logger.info(f"Processed {nodes_since_upload} nodes since last upload, uploading modified files to S3")
+                    logger.info(
+                        f"Processed {nodes_since_upload} nodes since last upload, uploading modified files to S3")
                     upload_success = self.upload_modified_files()
                     if upload_success:
                         nodes_since_upload = 0
@@ -1460,6 +1561,28 @@ class NodeETL:
             except Exception as e:
                 logger.error(f"Exception processing node {node}: {e}")
                 failed_nodes.append(node)
+
+        # Retry nodes that failed due to disk quota
+        if retry_nodes:
+            logger.info(f"Retrying {len(retry_nodes)} nodes that may have failed due to disk quota")
+            for node in retry_nodes:
+                try:
+                    success = self.process_node(node)
+                    if success:
+                        successful_nodes += 1
+                        nodes_since_upload += 1
+                        logger.info(f"Successfully processed node on retry: {node}")
+                        # Remove from failed nodes if it was there
+                        if node in failed_nodes:
+                            failed_nodes.remove(node)
+                    else:
+                        logger.warning(f"Failed to process node on retry: {node}")
+                        if node not in failed_nodes:
+                            failed_nodes.append(node)
+                except Exception as e:
+                    logger.error(f"Exception processing node {node} on retry: {e}")
+                    if node not in failed_nodes:
+                        failed_nodes.append(node)
 
         # Final upload of any remaining modified files
         if nodes_since_upload > 0:
