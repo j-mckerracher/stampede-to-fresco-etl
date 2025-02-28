@@ -87,19 +87,67 @@ class DownloadProgressTracker:
 
 
 class DiskQuotaManager:
-    """Manage disk quota to prevent exceeding limits and enable recovery"""
+    """Enhanced disk quota manager using subprocess for more accurate disk usage reporting"""
 
-    def __init__(self, max_quota_mb: int, temp_dir: Path, monthly_dir: Path, cache_dir: Path):
+    def __init__(self, max_quota_mb: int, temp_dir: Path, monthly_dir: Path, cache_dir: Path, home_dir: str = None):
         self.max_quota_mb = max_quota_mb
         self.temp_dir = temp_dir
         self.monthly_dir = monthly_dir
         self.cache_dir = cache_dir
         self.allocated_mb = 0
         self.lock = threading.Lock()
-        logger.info(f"DiskQuotaManager initialized with max quota: {max_quota_mb} MB")
+        self.home_dir = home_dir or os.path.expanduser("~")
+        self.use_system_commands = self._check_system_commands_available()
 
-    def get_current_disk_usage(self) -> int:
-        """Get current disk usage across all managed directories in MB"""
+        # Set a more conservative threshold for quota exceeded (85% instead of 95%)
+        self.quota_threshold = 0.85
+
+        logger.info(f"DiskQuotaManager initialized with max quota: {max_quota_mb} MB, " +
+                    f"using {'system' if self.use_system_commands else 'internal'} methods for disk usage calculation")
+
+        # Initial disk usage calculation
+        current_usage = self.get_current_disk_usage()
+        logger.info(
+            f"Initial disk usage: {current_usage} MB / {max_quota_mb} MB ({(current_usage / max_quota_mb) * 100:.1f}%)")
+
+    def _check_system_commands_available(self) -> bool:
+        """Check if system commands (du) are available for disk usage calculation"""
+        try:
+            import subprocess
+            result = subprocess.run(["du", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+            return result.returncode == 0
+        except (ImportError, FileNotFoundError, subprocess.SubprocessError):
+            logger.warning("System 'du' command not available, falling back to internal disk usage calculation")
+            return False
+
+    def get_system_disk_usage(self) -> int:
+        """Get disk usage using system 'du' command for accuracy"""
+        try:
+            import subprocess
+            # Run du command on home directory
+            result = subprocess.run(
+                ["du", "-sm", self.home_dir],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                text=True
+            )
+
+            if result.returncode == 0:
+                # Parse the output to get MB usage
+                output = result.stdout.strip()
+                usage_mb = int(output.split()[0])
+                logger.debug(f"System disk usage: {usage_mb} MB (from du command)")
+                return usage_mb
+            else:
+                logger.warning(f"Failed to get disk usage with 'du': {result.stderr}")
+                return self._calculate_internal_disk_usage()
+        except Exception as e:
+            logger.warning(f"Error getting system disk usage: {e}")
+            return self._calculate_internal_disk_usage()
+
+    def _calculate_internal_disk_usage(self) -> int:
+        """Calculate disk usage by summing file sizes (fallback method)"""
         try:
             total_size = 0
 
@@ -121,29 +169,47 @@ class DiskQuotaManager:
                     if path.is_file():
                         total_size += path.stat().st_size
 
-            return total_size // (1024 * 1024)
+            usage_mb = total_size // (1024 * 1024)
+            logger.debug(f"Internal disk usage calculation: {usage_mb} MB")
+            return usage_mb
         except Exception as e:
-            logger.error(f"Error calculating disk usage: {e}")
+            logger.error(f"Error calculating internal disk usage: {e}")
             # Return a conservative estimate
             return self.allocated_mb
+
+    def get_current_disk_usage(self) -> int:
+        """Get current disk usage in MB using the best available method"""
+        with self.lock:
+            if self.use_system_commands:
+                return self.get_system_disk_usage()
+            else:
+                return self._calculate_internal_disk_usage()
 
     def is_quota_exceeded(self) -> bool:
         """Check if current usage exceeds or is close to quota limit"""
         current_usage = self.get_current_disk_usage()
-        # Consider quota exceeded if at 95% or above
-        return current_usage >= (self.max_quota_mb * 0.95)
+        # More conservative threshold (85% instead of 95%)
+        return current_usage >= (self.max_quota_mb * self.quota_threshold)
+
+    def get_available_space_mb(self) -> int:
+        """Get available space in MB"""
+        current_usage = self.get_current_disk_usage()
+        available = max(0, self.max_quota_mb - current_usage)
+        return available
 
     def request_space(self, mb_needed: int) -> bool:
         """Request space allocation, returns True if space is available"""
         with self.lock:
             current_usage = self.get_current_disk_usage()
+            available = self.max_quota_mb - current_usage
+
             if current_usage + mb_needed <= self.max_quota_mb:
                 self.allocated_mb = current_usage + mb_needed
                 logger.debug(f"Space allocated: {mb_needed} MB, Total: {self.allocated_mb}/{self.max_quota_mb} MB")
                 return True
             else:
                 logger.warning(f"Cannot allocate {mb_needed} MB, would exceed quota. "
-                               f"Current: {current_usage}/{self.max_quota_mb} MB")
+                               f"Current: {current_usage}/{self.max_quota_mb} MB, Available: {available} MB")
                 return False
 
     def release_space(self, mb_to_release: int):
@@ -157,6 +223,7 @@ class DiskQuotaManager:
         with self.lock:
             actual_usage = self.get_current_disk_usage()
             logger.info(f"Disk usage recalculated: {actual_usage} MB (was tracking {self.allocated_mb} MB)")
+            logger.info(f"Available space: {self.max_quota_mb - actual_usage} MB / {self.max_quota_mb} MB")
             self.allocated_mb = actual_usage
 
 
@@ -1277,13 +1344,18 @@ class NodeETL:
 
     def recover_from_disk_quota_exceeded(self) -> bool:
         """
-        Handle disk quota exceeded scenario:
+        Enhanced recovery from disk quota exceeded:
         1. Upload all cached files to S3
         2. Delete cached files after successful upload
         3. Increment version counter
-        4. Return success status
+        4. Verify space was actually freed
+        5. Return success status
         """
         logger.info("Attempting to recover from disk quota exceeded")
+
+        # Measure current usage before recovery
+        pre_recovery_usage = self.quota_manager.get_current_disk_usage()
+        logger.info(f"Pre-recovery disk usage: {pre_recovery_usage} MB")
 
         # Get all files in cache
         cached_files = self.monthly_file_manager.get_all_cached_files()
@@ -1292,7 +1364,14 @@ class NodeETL:
             logger.warning("No cached files found for recovery")
             return False
 
-        logger.info(f"Found {len(cached_files)} cached files to upload")
+        # Calculate size of files to be removed
+        total_file_size = 0
+        for file_path in cached_files:
+            if file_path.exists():
+                total_file_size += file_path.stat().st_size
+
+        total_file_size_mb = total_file_size // (1024 * 1024)
+        logger.info(f"Found {len(cached_files)} cached files to upload, total size: {total_file_size_mb} MB")
 
         # Upload all files to S3
         success = self.s3_manager.upload_files(cached_files)
@@ -1304,8 +1383,11 @@ class NodeETL:
             files_deleted = 0
             for file_path in cached_files:
                 try:
-                    os.remove(file_path)
-                    files_deleted += 1
+                    if file_path.exists():
+                        file_size = file_path.stat().st_size
+                        os.remove(file_path)
+                        files_deleted += 1
+                        logger.debug(f"Deleted cached file: {file_path} ({file_size / (1024 * 1024):.2f} MB)")
                 except Exception as e:
                     logger.error(f"Error deleting cached file {file_path}: {e}")
 
@@ -1317,8 +1399,33 @@ class NodeETL:
             # Recalculate disk usage
             self.quota_manager.recalculate_usage()
 
+            # Verify space was actually freed
+            post_recovery_usage = self.quota_manager.get_current_disk_usage()
+            space_freed = max(0, pre_recovery_usage - post_recovery_usage)
+
+            logger.info(f"Recovery freed {space_freed} MB of disk space")
+            logger.info(f"Post-recovery disk usage: {post_recovery_usage} MB")
+
             # Clear the modified files list since we've uploaded everything
             self.monthly_file_manager.clear_modified_files()
+
+            # Check if we're still near quota limit despite recovery
+            if self.quota_manager.is_quota_exceeded():
+                logger.warning("Disk quota still exceeded after recovery - more aggressive cleanup needed")
+
+                # If we're still above threshold, attempt to clean temp directory as well
+                if self.temp_dir.exists():
+                    try:
+                        # Only remove subdirectories, not the main temp dir
+                        for path in self.temp_dir.glob('*'):
+                            if path.is_dir():
+                                shutil.rmtree(path, ignore_errors=True)
+                                logger.info(f"Removed temp subdirectory: {path}")
+                    except Exception as e:
+                        logger.error(f"Error cleaning temp directory: {e}")
+
+                # Recalculate again after temp cleanup
+                self.quota_manager.recalculate_usage()
 
             return True
         else:
@@ -1458,8 +1565,37 @@ class NodeETL:
 
         return success
 
+    def _estimate_node_file_sizes(self, node_name: str) -> int:
+        """Estimate the size of node files before download to check if we have enough space"""
+        try:
+            node_url = urljoin(self.base_url, f"{node_name}/")
+            required_files = ['block.csv', 'cpu.csv', 'nfs.csv', 'mem.csv']
+            total_size_mb = 0
+
+            # Create a session with short timeout for HEAD requests
+            with requests.Session() as session:
+                session.headers.update({'User-Agent': 'NodeETL/1.0'})
+
+                for file_name in required_files:
+                    file_url = urljoin(node_url, file_name)
+                    try:
+                        # Do a HEAD request to get file size
+                        head_response = session.head(file_url, timeout=(5, 10))
+                        if head_response.status_code == 200:
+                            size_bytes = int(head_response.headers.get('content-length', 0))
+                            size_mb = max(1, size_bytes // (1024 * 1024))
+                            total_size_mb += size_mb
+                            logger.debug(f"File {file_name} size: {size_mb} MB")
+                    except Exception as e:
+                        logger.debug(f"Error estimating size for {file_name}: {e}")
+
+            return total_size_mb
+        except Exception as e:
+            logger.error(f"Error estimating node file sizes: {e}")
+            return 0
+
     def process_node(self, node_name: str) -> bool:
-        """Process a single node end-to-end (with disk quota recovery)"""
+        """Process a single node end-to-end with improved disk quota management"""
         logger.info(f"Starting end-to-end processing for node: {node_name}")
 
         # Check if we're already processing this node (resuming after failure)
@@ -1485,26 +1621,68 @@ class NodeETL:
 
         success = False
         processed_files = {}
+        recovery_attempted = False
+
+        # Check available space and log it
+        available_space = self.quota_manager.get_available_space_mb()
+        logger.info(f"Available space before processing node {node_name}: {available_space} MB")
 
         # Check if we have enough disk space before proceeding
         if self.quota_manager.is_quota_exceeded():
             logger.warning(f"Disk quota near exceeded before processing node {node_name}, triggering recovery")
             if not self.recover_from_disk_quota_exceeded():
                 logger.error(f"Failed to recover disk space, cannot process node {node_name}")
+                # Release the node without marking as processed
+                self.monthly_file_manager.release_current_node()
                 return False
+            recovery_attempted = True
+            # Recheck available space after recovery
+            available_space = self.quota_manager.get_available_space_mb()
+            logger.info(f"Available space after recovery: {available_space} MB")
 
         try:
+            # Try to get file sizes before download to check if we have enough space
+            estimated_size = self._estimate_node_file_sizes(node_name)
+            if estimated_size > 0:
+                logger.info(f"Estimated size for node {node_name}: {estimated_size} MB")
+                if estimated_size > available_space:
+                    logger.warning(
+                        f"Insufficient space for node {node_name} (need {estimated_size} MB, have {available_space} MB)")
+                    if not recovery_attempted:
+                        logger.info("Attempting recovery to free up space")
+                        if not self.recover_from_disk_quota_exceeded():
+                            logger.error("Recovery failed, cannot process node")
+                            self.monthly_file_manager.release_current_node()
+                            return False
+                        # Check if we have enough space after recovery
+                        available_space = self.quota_manager.get_available_space_mb()
+                        logger.info(f"Available space after recovery: {available_space} MB")
+                        if estimated_size > available_space:
+                            logger.error(
+                                f"Still insufficient space after recovery (need {estimated_size} MB, have {available_space} MB)")
+                            self.monthly_file_manager.release_current_node()
+                            return False
+                    else:
+                        logger.error("Recovery already attempted, still insufficient space")
+                        self.monthly_file_manager.release_current_node()
+                        return False
+
             # Download node data
             download_success = self.node_downloader.download_node_files(node_name)
 
             # If download failed due to disk quota, try recovery and retry
             if not download_success:
-                if self.quota_manager.is_quota_exceeded():
+                if self.quota_manager.is_quota_exceeded() and not recovery_attempted:
                     logger.warning(f"Download failed due to disk quota, attempting recovery")
                     if self.recover_from_disk_quota_exceeded():
                         logger.info(f"Recovery successful, retrying download for node {node_name}")
                         # Retry download after recovery
                         download_success = self.node_downloader.download_node_files(node_name)
+                        recovery_attempted = True
+                    else:
+                        logger.error("Recovery failed, cannot process node")
+                elif recovery_attempted:
+                    logger.error("Recovery already attempted, download still failed")
 
             if not download_success:
                 logger.error(f"Failed to download data for node {node_name}")
