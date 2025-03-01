@@ -29,8 +29,7 @@ logger = logging.getLogger(__name__)
 # Initialize the S3 client
 s3_client = boto3.client(
     's3',
-    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+
     region_name='us-east-1'
 )
 
@@ -256,34 +255,82 @@ def handle_monthly_data(monthly_data: Dict[str, pl.DataFrame]) -> Dict[str, Path
     return processed_files
 
 
-def main(node):
-    start = time.time()
+def process_node(node, node_data_proc, node_list):
+    """Process a single node and return success status"""
+    try:
+        links = node_list[node]["urls"]
 
+        # 1 - check disk space and upload to s3 if no space left
+        if not free_disk_space_available():
+            upload_file_to_s3("cache", "data-transform-stampede")
+
+        # 2 - download files
+        for link in links:
+            download_file(link, "cache")
+
+        # 3 - process files
+        node_df = node_data_proc.process_node_data()
+
+        # 4 - group results into monthly files
+        monthly_data = process_node_data_to_monthly(node_df)
+        processed_files = handle_monthly_data(monthly_data)
+
+        return True  # Success
+    except Exception as e:
+        logging.error(f"Error processing {node}: {str(e)}")
+        return False  # Failure
+
+
+def update_node_status(node_list, node, status):
+    """Update the Complete status for a node and save to the JSON file"""
+    node_list[node]["Complete"] = status
+
+    # Save the updated node list back to the file
+    with open('node-list.json', 'w') as file:
+        json.dump(node_list, file, indent=4)
+
+
+def main(num_nodes_to_process):
+    """Process a specified number of incomplete nodes"""
+    start = time.time()
+    processed_count = 0
+
+    # Create data processor
     node_data_proc = data_processor.NodeDataProcessor()
 
+    # Load the node list
     with open('node-list.json', 'r') as file:
         node_list = json.load(file)
 
-    links = node_list[node]["urls"]
+    # Find incomplete nodes
+    incomplete_nodes = [node for node, data in node_list.items()
+                        if not data.get("Complete", False)]
 
-    # 1 - check disk space and upload to s3 if no space left
-    if not free_disk_space_available():
-        upload_file_to_s3("cache", "data-transform-stampede")
+    print(f"Found {len(incomplete_nodes)} incomplete nodes")
 
-    # 2 - download files
-    for link in links:
-        download_file(link, "cache")
+    # Process the specified number of nodes (or all if num_nodes_to_process is larger)
+    nodes_to_process = incomplete_nodes[:num_nodes_to_process]
 
-    # 3 - process files
-    node_df = node_data_proc.process_node_data()
+    for node in nodes_to_process:
+        print(f"Processing {node}...")
+        node_start = time.time()
 
-    # 4 - group results into monthly files
-    monthly_data = process_node_data_to_monthly(node_df)
-    processed_files = handle_monthly_data(monthly_data)
+        # Process the node and get success status
+        success = process_node(node, node_data_proc, node_list)
+
+        # Update the node status in the JSON file
+        update_node_status(node_list, node, success)
+
+        if success:
+            processed_count += 1
+
+        node_end = time.time()
+        print(f"Completed {node} in {node_end - node_start:.2f} seconds (Success: {success})")
 
     end = time.time()
-    print(end - start)
+    print(f"Processed {processed_count} nodes successfully out of {len(nodes_to_process)} attempted")
+    print(f"Total execution time: {end - start:.2f} seconds")
 
 
 if __name__ == "__main__":
-    main("NODE1")
+    main(31)
