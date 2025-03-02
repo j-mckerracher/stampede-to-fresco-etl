@@ -105,7 +105,7 @@ def main():
     prefix_file_names(args.start, args.end)
 
     # 2. Upload all files to S3
-    upload_folder_to_s3()
+    upload_to_s3()
 
 
 if __name__ == "__main__":
