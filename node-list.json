@@ -3570,7 +3570,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1355/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1355/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1356": {
         "urls": [
