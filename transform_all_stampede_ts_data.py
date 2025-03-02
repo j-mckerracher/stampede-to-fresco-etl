@@ -3,7 +3,6 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
-
 import requests
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import os
@@ -14,6 +13,8 @@ import shutil
 import time
 import data_processor
 import polars as pl
+
+start_index = 221
 
 # Set up logging
 logging.basicConfig(
@@ -303,16 +304,14 @@ def main(num_nodes_to_process):
         node_list = json.load(file)
 
     # Find incomplete nodes
-    incomplete_nodes = [node for node, data in node_list.items()
-                        if not data.get("Complete", False)]
-
-    print(f"Found {len(incomplete_nodes)} incomplete nodes")
+    nodes = [node for node, data in node_list.items()]
 
     # Process the specified number of nodes (or all if num_nodes_to_process is larger)
-    nodes_to_process = incomplete_nodes[:num_nodes_to_process]
+    nodes_to_process = nodes[start_index:start_index+num_nodes_to_process]
 
+    count = 1
     for node in nodes_to_process:
-        print(f"Processing {node}...")
+        print(f"Processing {node}... number {count}/{num_nodes_to_process}")
         node_start = time.time()
 
         # Process the node and get success status
@@ -333,4 +332,4 @@ def main(num_nodes_to_process):
 
 
 if __name__ == "__main__":
-    main(31)
+    main(100)
