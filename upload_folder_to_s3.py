@@ -28,31 +28,56 @@ def get_s3_client():
     )
 
 
+s3_client = get_s3_client()
+
+
 @retry(
     stop=stop_after_attempt(3),  # Try up to 3 times
     wait=wait_fixed(2),  # Wait 2 seconds between attempts
     retry=retry_if_exception_type((BotoCoreError, ClientError))
 )
-def upload_to_s3(bucket_name="conte-transform-to-fresco-ts"):
-    """Upload files to S3 public bucket without requiring credentials"""
-    logger.info("\nStarting S3 upload...")
+def upload_file_to_s3(file_path: str, bucket_name: str) -> None:
+    """
+    Uploads a single file to an S3 bucket.
 
-    s3_client = get_s3_client()
+    Args:
+        file_path (str): Local path to the file.
+        bucket_name (str): Name of the S3 bucket.
 
-    for i, file_path in enumerate("cache", 1):
-        file_name = os.path.basename("cache")
-        # Add content type for CSV files
-        extra_args = {
-            'ContentType': 'text/csv'
-        }
+    Raises:
+        BotoCoreError, ClientError: If the upload fails due to a boto3 error.
+    """
+    # Add content type for CSV files
+    extra_args = {
+        'ContentType': 'text/csv'
+    }
 
-        logger.info(f"Uploading {file_path} to {bucket_name}/{file_name}")
-        s3_client.upload_file(
-            file_path,
-            bucket_name,
-            file_name,
-            ExtraArgs=extra_args
-        )
+    # Use the filename as the S3 key
+    s3_key = os.path.basename(file_path)
+
+    logger.info(f"Uploading {file_path} to {bucket_name}/{s3_key}")
+    s3_client.upload_file(file_path, bucket_name, s3_key, ExtraArgs=extra_args)
+
+
+def upload_folder_to_s3() -> None:
+    """
+    Uploads all files in the given folder to the specified S3 bucket.
+    """
+    # Define the cache directory
+    cache_dir = "cache"
+
+    bucket_name = "conte-transform-to-fresco-ts"
+    logger.info(f"Uploading files from {cache_dir} to {bucket_name}")
+
+    count = 1
+    for filename in os.listdir(cache_dir):
+        # Use the full file path
+        file_path = os.path.join(cache_dir, filename)
+        upload_file_to_s3(file_path, bucket_name)
+        logger.info(f"Uploading {filename} . . .")
+        count += 1
+
+    logger.info(f"Done uploading {count} files.")
 
 
 def prefix_file_names(start: str, end: str) -> str:
@@ -105,7 +130,7 @@ def main():
     prefix_file_names(args.start, args.end)
 
     # 2. Upload all files to S3
-    upload_to_s3()
+    upload_folder_to_s3()
 
 
 if __name__ == "__main__":
