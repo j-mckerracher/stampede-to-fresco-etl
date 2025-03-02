@@ -14,7 +14,7 @@ import time
 import data_processor
 import polars as pl
 
-start_index = 221
+start_index = 301
 
 # Set up logging
 logging.basicConfig(
@@ -313,6 +313,7 @@ def main(num_nodes_to_process):
     for node in nodes_to_process:
         print(f"Processing {node}... number {count}/{num_nodes_to_process}")
         node_start = time.time()
+        count += 1
 
         # Process the node and get success status
         success = process_node(node, node_data_proc, node_list)
@@ -332,4 +333,4 @@ def main(num_nodes_to_process):
 
 
 if __name__ == "__main__":
-    main(100)
+    main(600)
