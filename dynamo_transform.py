@@ -228,5 +228,5 @@ def process_node_group(start_index: int):
 
 
 if __name__ == "__main__":
-    for index in range(981, 6170, 40):
+    for index in range(981, 6170, 41):
         process_node_group(index)

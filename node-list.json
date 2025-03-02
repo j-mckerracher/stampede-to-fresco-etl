@@ -3606,7 +3606,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1359/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1359/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE136": {
         "urls": [
@@ -3615,7 +3615,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE136/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE136/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1360": {
         "urls": [
@@ -3624,7 +3624,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1360/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1360/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1361": {
         "urls": [
@@ -3633,7 +3633,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1361/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1361/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1362": {
         "urls": [
