@@ -29,4 +29,4 @@ def find_node_index(node_id, json_file_path):
         return -1
 
 
-index = find_node_index("NODE1845", "node-list.json")
+index = find_node_index("NODE1881", "node-list.json")

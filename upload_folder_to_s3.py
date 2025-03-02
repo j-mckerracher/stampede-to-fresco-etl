@@ -1,5 +1,4 @@
-import argparse
-
+import glob
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
@@ -9,11 +8,7 @@ import os
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('node_etl.log')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -59,7 +54,7 @@ def upload_file_to_s3(file_path: str, bucket_name: str) -> None:
     s3_client.upload_file(file_path, bucket_name, s3_key, ExtraArgs=extra_args)
 
 
-def upload_folder_to_s3() -> None:
+def upload_folder_to_s3() -> bool:
     """
     Uploads all files in the given folder to the specified S3 bucket.
     """
@@ -74,10 +69,43 @@ def upload_folder_to_s3() -> None:
         # Use the full file path
         file_path = os.path.join(cache_dir, filename)
         upload_file_to_s3(file_path, bucket_name)
-        logger.info(f"Uploading {filename} . . .")
         count += 1
 
     logger.info(f"Done uploading {count} files.")
+    return True
+
+
+def remove_csv_files_from_cache():
+    """
+    Removes all CSV files from the 'cache' directory.
+
+    Returns:
+        int: The number of files removed
+    """
+    # Define the cache directory
+    cache_dir = "cache"
+
+    # Check if the directory exists
+    if not os.path.exists(cache_dir):
+        print(f"Error: '{cache_dir}' directory does not exist.")
+        return 0
+
+    # Get a list of all CSV files in the cache directory
+    csv_files = glob.glob(os.path.join(cache_dir, "*.csv"))
+
+    # Count the number of files to be removed
+    file_count = len(csv_files)
+
+    # Remove each CSV file
+    for file_path in csv_files:
+        try:
+            os.remove(file_path)
+            print(f"Removed: {file_path}")
+        except Exception as e:
+            print(f"Error removing {file_path}: {e}")
+
+    print(f"Done. Removed {file_count} CSV files from the cache directory.")
+    return file_count
 
 
 def prefix_file_names(start: str, end: str) -> str:
@@ -112,26 +140,15 @@ def prefix_file_names(start: str, end: str) -> str:
             # Rename the file
             os.rename(old_path, new_path)
             count += 1
-            logger.info(f"Renamed: {filename} -> {prefix + filename}")
 
     logger.info(f"Done renaming. Renamed {count} files")
 
 
-def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Process files in cache directory and upload to S3.')
-    parser.add_argument('start', type=str, help='Start value for the file prefix')
-    parser.add_argument('end', type=str, help='End value for the file prefix')
-
-    # Parse arguments
-    args = parser.parse_args()
-
+def main(start_index: str, end_index: str):
     # 1. Rename all files with the provided prefix
-    prefix_file_names(args.start, args.end)
+    prefix_file_names(start_index, end_index)
 
     # 2. Upload all files to S3
-    upload_folder_to_s3()
-
-
-if __name__ == "__main__":
-    main()
+    if upload_folder_to_s3():
+        # 3. Clear cache
+        remove_csv_files_from_cache()
