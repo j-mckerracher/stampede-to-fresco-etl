@@ -40,7 +40,7 @@ def upload_to_s3(bucket_name="conte-transform-to-fresco-ts"):
     s3_client = get_s3_client()
 
     for i, file_path in enumerate("cache", 1):
-        file_name = os.path.basename(file_path)
+        file_name = os.path.basename("cache")
         # Add content type for CSV files
         extra_args = {
             'ContentType': 'text/csv'
