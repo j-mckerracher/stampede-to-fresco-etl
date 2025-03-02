@@ -33,12 +33,11 @@ s3_client = boto3.client(
 )
 def upload_file_to_s3(file_path: str, bucket_name: str) -> None:
     """
-    Uploads a single file to an S3 bucket with the specified S3 key.
+    Uploads a single file to an S3 bucket.
 
     Args:
         file_path (str): Local path to the file.
         bucket_name (str): Name of the S3 bucket.
-        s3_key (str): The key (path) under which to store the file in S3.
 
     Raises:
         BotoCoreError, ClientError: If the upload fails due to a boto3 error.
@@ -47,8 +46,12 @@ def upload_file_to_s3(file_path: str, bucket_name: str) -> None:
     extra_args = {
         'ContentType': 'text/csv'
     }
-    logger.info(f"Uploading {file_path} to {bucket_name}/{file_path}")
-    s3_client.upload_file(file_path, bucket_name, ExtraArgs=extra_args)
+
+    # Use the filename as the S3 key
+    s3_key = os.path.basename(file_path)
+
+    logger.info(f"Uploading {file_path} to {bucket_name}/{s3_key}")
+    s3_client.upload_file(file_path, bucket_name, s3_key, ExtraArgs=extra_args)
 
 
 def upload_folder_to_s3() -> None:
