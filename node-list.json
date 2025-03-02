@@ -3516,7 +3516,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE135/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE135/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1350": {
         "urls": [
@@ -3525,7 +3525,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1350/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1350/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1351": {
         "urls": [
@@ -3534,7 +3534,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1351/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1351/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1352": {
         "urls": [
@@ -3543,7 +3543,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1352/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1352/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1353": {
         "urls": [
@@ -3552,7 +3552,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1353/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1353/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1354": {
         "urls": [
@@ -3561,7 +3561,7 @@
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1354/nfs.csv",
             "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/NODE1354/mem.csv"
         ],
-        "Complete": false
+        "Complete": true
     },
     "NODE1355": {
         "urls": [

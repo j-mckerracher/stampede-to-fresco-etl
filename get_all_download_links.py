@@ -56,16 +56,6 @@ def download_folder_threaded(folder_url: str, local_folder: str, required_files,
     return node_dict
 
 
-# base_dir = os.getcwd()
-# base_url = "https://www.datadepot.rcac.purdue.edu/sbagchi/fresco/repository/Stampede/TACC_Stats/"
-# required_files = ['block.csv', 'cpu.csv', 'mem.csv', 'llite.csv']
-# headers = {
-#     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-# }
-#
-# result = download_folder_threaded(base_url, base_dir, required_files, headers)
-
-
 def update_json_with_complete_flag(json_file_path, output_file_path=None):
     """
     Update a JSON file by adding a "Complete" flag set to False for each NODE key.
