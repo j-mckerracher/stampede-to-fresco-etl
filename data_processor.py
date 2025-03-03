@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 class NodeDataProcessor:
-    """Process node data files using Polars to transform Stampede data into FRESCO format
+    """Process node data files using Polars to transform Stampede data into Anvil format
 
-    The FRESCO format standardizes resource usage metrics across multiple HPC systems
+    The Anvil format standardizes resource usage metrics across multiple HPC systems
     with a common schema: Job Id, Host, Timestamp, Event, Value, Units.
     This processor handles the transformation of block I/O, CPU usage, NFS traffic,
     and memory metrics into this unified format.
@@ -32,12 +32,12 @@ class NodeDataProcessor:
         self.cache_dir.mkdir(exist_ok=True, parents=True)
 
     def process_block_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform block device metrics into FRESCO format
+        """Transform block device metrics into Anvil format
 
         Calculates block device throughput (GB/s) by:
         1. Summing read and write sectors (512 bytes each)
         2. Dividing by the time spent on I/O operations (in milliseconds)
-        3. Converting to GB/s for FRESCO's standardized reporting
+        3. Converting to GB/s for Anvil's standardized reporting
         """
         logger.info(f"Processing block file: {file_path}")
         try:
@@ -68,7 +68,7 @@ class NodeDataProcessor:
                 .alias('Value')
             ])
 
-            # Transform to FRESCO schema with standardized column names and formats
+            # Transform to Anvil schema with standardized column names and formats
             # Event type 'block' represents block device I/O throughput
             return df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
@@ -83,14 +83,14 @@ class NodeDataProcessor:
             return None
 
     def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform CPU usage metrics into FRESCO format
+        """Transform CPU usage metrics into Anvil format
 
         Calculates CPU user mode percentage by:
         1. Computing total CPU ticks across all states
         2. Determining the percentage of user+nice ticks relative to total
         3. Ensuring values are in valid percentage range (0-100%)
 
-        This matches FRESCO's 'cpuuser' metric which represents user-space CPU utilization
+        This matches Anvil's 'cpuuser' metric which represents user-space CPU utilization
         """
         logger.info(f"Processing CPU file: {file_path}")
         try:
@@ -114,7 +114,7 @@ class NodeDataProcessor:
                 .alias('Value')
             ])
 
-            # Transform to FRESCO schema with standardized column names
+            # Transform to Anvil schema with standardized column names
             # Event type 'cpuuser' represents CPU utilization in user mode
             return df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
@@ -129,21 +129,21 @@ class NodeDataProcessor:
             return None
 
     def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform NFS traffic metrics into FRESCO format
+        """Transform NFS traffic metrics into Anvil format
 
         Calculates NFS throughput (MB/s) by:
         1. Summing bytes received during READ operations and bytes sent during WRITE operations
         2. Converting to MB by dividing by (1024*1024)
         3. Computing the rate by dividing cumulative bytes by time elapsed between measurements
 
-        This provides a measure of network file system activity matching FRESCO's 'nfs' metric
+        This provides a measure of network file system activity matching Anvil's 'nfs' metric
         """
         logger.info(f"Processing NFS file: {file_path}")
         try:
             df = pl.read_csv(file_path)
 
             # Calculate total NFS traffic by combining READ bytes received and WRITE bytes sent
-            # Convert to MB for consistent reporting in FRESCO
+            # Convert to MB for consistent reporting in Anvil
             df = df.with_columns([
                 ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
                 pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
@@ -161,7 +161,7 @@ class NodeDataProcessor:
                 (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
             ])
 
-            # Transform to FRESCO schema with standardized column names
+            # Transform to Anvil schema with standardized column names
             # Event type 'nfs' represents network file system throughput
             return df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
@@ -176,13 +176,13 @@ class NodeDataProcessor:
             return None
 
     def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
-        """Transform memory usage metrics into FRESCO format
+        """Transform memory usage metrics into Anvil format
 
         Calculates two memory metrics:
         1. Total memory usage (memused) - All physical memory used by the OS
         2. Memory usage excluding disk cache (memused_minus_diskcache) - Memory used by applications
 
-        Both metrics are converted to GB to align with FRESCO's standardized reporting
+        Both metrics are converted to GB to align with Anvil's standardized reporting
         """
         logger.info(f"Processing memory file: {file_path}")
         try:
@@ -195,7 +195,7 @@ class NodeDataProcessor:
                 pl.col(col).mul(1024) for col in memory_cols if col in df.columns
             ])
 
-            # Calculate memory metrics in GB for FRESCO standardization:
+            # Calculate memory metrics in GB for Anvil standardization:
             # 1. Total memory used by the system
             # 2. Memory used excluding disk cache (FilePages represents cache)
             # The .clip(0, None) prevents negative values that could occur due to timing differences
@@ -206,7 +206,7 @@ class NodeDataProcessor:
                 .alias('memused_minus_diskcache')
             ])
 
-            # Create FRESCO-formatted DataFrame for total memory usage
+            # Create Anvil-formatted DataFrame for total memory usage
             memused_df = df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
@@ -216,7 +216,7 @@ class NodeDataProcessor:
                 pl.lit('GB').alias('Units')
             ])
 
-            # Create FRESCO-formatted DataFrame for memory usage excluding disk cache
+            # Create Anvil-formatted DataFrame for memory usage excluding disk cache
             memused_nocache_df = df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
@@ -233,10 +233,10 @@ class NodeDataProcessor:
             return None
 
     def process_node_data(self) -> pl.DataFrame:
-        """Process all metrics for a node and combine into a unified FRESCO-format DataFrame
+        """Process all metrics for a node and combine into a unified Anvil-format DataFrame
 
         This function orchestrates the processing of different metric types (block, CPU, NFS, memory)
-        and combines them into a single DataFrame conforming to the FRESCO schema:
+        and combines them into a single DataFrame conforming to the Anvil schema:
         - Job Id: Unique job identifier (standardized format)
         - Host: Origin node where data was gathered
         - Timestamp: When the data point was recorded
@@ -287,7 +287,7 @@ class NodeDataProcessor:
                 # Delete file after processing
                 os.remove(mem_path)
 
-            # Combine all DataFrames into a single FRESCO-format DataFrame
+            # Combine all DataFrames into a single Anvil-format DataFrame
             if dfs:
                 # ThreadPoolExecutor is set up for potential future parallelization
                 # Currently, it simply wraps the DataFrames
@@ -297,7 +297,7 @@ class NodeDataProcessor:
                     futures = [executor.submit(lambda df=df: df) for df in dfs]
                     processed_dfs = [future.result() for future in futures]
 
-                # Concatenate all metrics into a unified DataFrame following FRESCO schema
+                # Concatenate all metrics into a unified DataFrame following Anvil schema
                 result = pl.concat(processed_dfs)
                 logger.info(f"Successfully processed node data with {len(result)} rows")
                 return result
