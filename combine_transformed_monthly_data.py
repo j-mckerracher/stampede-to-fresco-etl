@@ -2,6 +2,7 @@ import os
 import boto3
 import shutil
 import uuid
+import gc
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from botocore.exceptions import BotoCoreError, ClientError
 import logging
@@ -20,11 +21,14 @@ logger = logging.getLogger(__name__)
 download_bucket = "conte-transform-to-fresco-ts"
 upload_bucket = "stampede-proc-metrics-fresco-form"
 
-# Batch size for processing files
-BATCH_SIZE = 5
+# Smaller batch size to reduce memory usage
+BATCH_SIZE = 3
 
 # Base directory for temporary files
-TEMP_BASE_DIR = "s3_processor"
+TEMP_BASE_DIR = "/tmp/s3_processor"
+
+# Cap max rows in memory for streaming operations
+MAX_ROWS_IN_MEMORY = 500000
 
 
 def get_s3_client():
@@ -88,100 +92,177 @@ def clean_temp_dir(temp_dir):
         logger.warning(f"Failed to clean up directory {temp_dir}: {str(e)}")
 
 
-def process_batches_for_year_month(year_month, files, temp_dir):
-    """Process files in batches to manage memory usage"""
-    s3_client = get_s3_client()
-
-    # Create a temporary directory for intermediate files
-    intermediate_dir = os.path.join(temp_dir, "intermediate")
-    os.makedirs(intermediate_dir, exist_ok=True)
-
-    # Process files in batches
-    batches = [files[i:i + BATCH_SIZE] for i in range(0, len(files), BATCH_SIZE)]
-
-    # Track unique rows using a set
-    batch_counter = 0
-
-    for batch_idx, batch in enumerate(batches):
-        logger.info(f"Processing batch {batch_idx + 1}/{len(batches)} for {year_month}")
-
-        # List to store dataframes for this batch
-        batch_dfs = []
-
-        for file in batch:
-            try:
-                # Define download path
-                download_path = os.path.join(temp_dir, os.path.basename(file))
-
-                # Download the file
-                s3_client.download_file(download_bucket, file, download_path)
-
-                # Read CSV with Polars
-                df = pl.read_csv(download_path)
-                batch_dfs.append(df)
-
-                # Clean up downloaded file immediately
-                os.remove(download_path)
-
-                logger.info(f"Processed {file}, read {len(df)} rows")
-
-            except Exception as e:
-                logger.error(f"Error processing file {file}: {str(e)}")
-                continue
-
-        if batch_dfs:
-            # Combine all dataframes in this batch
-            batch_df = pl.concat(batch_dfs)
-
-            # If this is the first batch, create the unique file
-            if batch_idx == 0:
-                unique_df = batch_df.unique()
-                intermediate_path = os.path.join(intermediate_dir, f"batch_{batch_idx}_{year_month}.parquet")
-                unique_df.write_parquet(intermediate_path)
-            else:
-                # Read the previous unique file
-                prev_unique_path = os.path.join(intermediate_dir, f"batch_{batch_idx - 1}_{year_month}.parquet")
-                prev_unique_df = pl.read_parquet(prev_unique_path)
-
-                # Combine with current batch and deduplicate
-                combined_df = pl.concat([prev_unique_df, batch_df])
-                unique_df = combined_df.unique()
-
-                # Write to new intermediate file
-                intermediate_path = os.path.join(intermediate_dir, f"batch_{batch_idx}_{year_month}.parquet")
-                unique_df.write_parquet(intermediate_path)
-
-                # Remove previous intermediate file to save space
-                os.remove(prev_unique_path)
-
-            # Clear memory
-            del batch_dfs
-            del batch_df
-            if batch_idx > 0:
-                del prev_unique_df
-                del combined_df
-            del unique_df
-
-    # Get the final intermediate file
-    final_intermediate_path = os.path.join(intermediate_dir, f"batch_{len(batches) - 1}_{year_month}.parquet")
-
-    if not os.path.exists(final_intermediate_path):
-        logger.error(f"No data processed for {year_month}")
+def get_schema_from_file(s3_client, file):
+    """Get schema from a file to use for lazy processing"""
+    temp_file = os.path.join("/tmp", os.path.basename(file))
+    try:
+        s3_client.download_file(download_bucket, file, temp_file)
+        # Just read the first few rows to get schema
+        df = pl.scan_csv(temp_file, infer_schema_length=100)
+        schema = df.collect(100).schema
+        os.remove(temp_file)
+        return schema
+    except Exception as e:
+        logger.error(f"Failed to get schema from {file}: {str(e)}")
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         return None
 
-    # Read the final intermediate file
-    final_df = pl.read_parquet(final_intermediate_path)
 
-    # Create the output file directly in the final format
-    output_file = os.path.join(temp_dir, f"combined_node_data_{year_month}.csv")
-    final_df.write_csv(output_file)
+def stream_process_file(s3_client, file, output_dir, file_counter, schema=None):
+    """Stream process a single file using lazy evaluation"""
+    download_path = os.path.join(output_dir, f"download_{file_counter}.csv")
+    output_path = os.path.join(output_dir, f"processed_{file_counter}.parquet")
 
-    logger.info(f"Created combined file {output_file} with {len(final_df)} unique rows")
+    try:
+        # Download file
+        s3_client.download_file(download_bucket, file, download_path)
+        logger.info(f"Downloaded {file} to {download_path}")
 
-    # Clean up intermediate directory
-    shutil.rmtree(intermediate_dir)
+        # Process using lazy evaluation
+        if schema:
+            df_lazy = pl.scan_csv(download_path, schema=schema)
+        else:
+            df_lazy = pl.scan_csv(download_path)
 
-    return output_file
+        # Sort by all columns to prepare for deduplication
+        df_lazy = df_lazy.sort(by=df_lazy.columns)
+
+        # Write to parquet (more efficient storage)
+        df_lazy.sink_parquet(output_path)
+
+        # Clean up CSV file immediately
+        os.remove(download_path)
+        logger.info(f"Processed {file} and saved to {output_path}")
+
+        # Force garbage collection
+        gc.collect()
+
+        return output_path
+    except Exception as e:
+        logger.error(f"Error processing file {file}: {str(e)}")
+        if os.path.exists(download_path):
+            os.remove(download_path)
+        return None
+
+
+def external_merge_sort(parquet_files, output_dir, year_month):
+    """Perform external merge sort on parquet files with deduplication"""
+    if not parquet_files:
+        logger.error("No files to merge")
+        return None
+
+    # Final output path
+    final_output = os.path.join(output_dir, f"combined_node_data_{year_month}.csv")
+
+    # If there's just one file, convert it directly
+    if len(parquet_files) == 1:
+        df = pl.scan_parquet(parquet_files[0]).collect()
+        df.write_csv(final_output)
+        os.remove(parquet_files[0])
+        return final_output
+
+    logger.info(f"Beginning external merge sort for {len(parquet_files)} files")
+
+    # Process in pairs to reduce memory usage
+    while len(parquet_files) > 1:
+        new_parquet_files = []
+
+        # Process files in pairs
+        for i in range(0, len(parquet_files), 2):
+            if i + 1 < len(parquet_files):
+                # We have a pair
+                file1 = parquet_files[i]
+                file2 = parquet_files[i + 1]
+
+                merge_output = os.path.join(output_dir, f"merge_{i}_{uuid.uuid4().hex[:8]}.parquet")
+
+                # Use lazy evaluation for merging
+                df1_lazy = pl.scan_parquet(file1)
+                df2_lazy = pl.scan_parquet(file2)
+
+                # Concatenate and remove duplicates
+                (
+                    pl.concat([df1_lazy, df2_lazy])
+                    .unique()
+                    .sink_parquet(merge_output)
+                )
+
+                # Clean up input files
+                os.remove(file1)
+                os.remove(file2)
+
+                # Add merged file to new list
+                new_parquet_files.append(merge_output)
+
+                # Force garbage collection
+                gc.collect()
+
+            else:
+                # Odd number of files, just add the last one
+                new_parquet_files.append(parquet_files[i])
+
+        # Update our file list for next iteration
+        parquet_files = new_parquet_files
+        logger.info(f"Merge iteration complete, now have {len(parquet_files)} files")
+
+    # Final output conversion from parquet to csv
+    if parquet_files:
+        df = pl.scan_parquet(parquet_files[0]).collect()
+        df.write_csv(final_output)
+        os.remove(parquet_files[0])
+
+        logger.info(f"Created final combined file {final_output} with {len(df)} rows")
+        return final_output
+
+    return None
+
+
+def process_year_month_streaming(year_month, files):
+    """Process files for a year-month using streaming to minimize memory usage"""
+    temp_dir = create_temp_dir()
+    logger.info(f"Processing {len(files)} files for {year_month} in directory {temp_dir}")
+
+    try:
+        s3_client = get_s3_client()
+
+        # Get schema from first file to use for all files
+        schema = get_schema_from_file(s3_client, files[0]) if files else None
+
+        # Process files individually to parquet format
+        parquet_files = []
+        for i, file in enumerate(files):
+            # Log progress
+            if i % 5 == 0:
+                logger.info(f"Processing file {i + 1}/{len(files)} for {year_month}")
+
+            parquet_file = stream_process_file(s3_client, file, temp_dir, i, schema)
+            if parquet_file:
+                parquet_files.append(parquet_file)
+
+            # Force garbage collection
+            gc.collect()
+
+        # Merge the parquet files with external merge sort
+        final_output = external_merge_sort(parquet_files, temp_dir, year_month)
+
+        if final_output:
+            # Upload the final result to S3
+            upload_file_to_s3(final_output, upload_bucket)
+
+            # Clean up temporary directory
+            clean_temp_dir(temp_dir)
+            return True
+
+        # Clean up even if processing failed
+        clean_temp_dir(temp_dir)
+        return False
+
+    except Exception as e:
+        logger.error(f"Error processing {year_month}: {str(e)}")
+        # Ensure cleanup happens even if there's an exception
+        clean_temp_dir(temp_dir)
+        return False
 
 
 @retry(
@@ -203,35 +284,6 @@ def upload_file_to_s3(file_path, bucket_name):
     # Remove the file after successful upload
     os.remove(file_path)
     logger.info(f"Uploaded and removed local file: {file_path}")
-
-
-def process_year_month(year_month, files):
-    """Process all files for a given year-month"""
-    # Create a custom temporary directory for this year-month
-    temp_dir = create_temp_dir()
-    logger.info(f"Processing {len(files)} files for {year_month} in directory {temp_dir}")
-
-    try:
-        # Process files in batches
-        output_file = process_batches_for_year_month(year_month, files, temp_dir)
-
-        if output_file:
-            # Upload the final result to S3
-            upload_file_to_s3(output_file, upload_bucket)
-
-            # Clean up temporary directory
-            clean_temp_dir(temp_dir)
-            return True
-
-        # Clean up even if processing failed
-        clean_temp_dir(temp_dir)
-        return False
-
-    except Exception as e:
-        logger.error(f"Error processing {year_month}: {str(e)}")
-        # Ensure cleanup happens even if there's an exception
-        clean_temp_dir(temp_dir)
-        return False
 
 
 def cleanup_temp_base_dir():
@@ -256,11 +308,14 @@ def main():
 
         # 3. Process each year-month combination separately
         for year_month, files in year_month_combos.items():
-            success = process_year_month(year_month, files)
+            success = process_year_month_streaming(year_month, files)
             if success:
                 logger.info(f"Successfully processed {year_month}")
             else:
                 logger.error(f"Failed to process {year_month}")
+
+            # Force garbage collection between year-months
+            gc.collect()
 
     finally:
         # Final cleanup of temporary directories
