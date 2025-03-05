@@ -21,14 +21,8 @@ logger = logging.getLogger(__name__)
 download_bucket = "conte-transform-to-fresco-ts"
 upload_bucket = "stampede-proc-metrics-fresco-form"
 
-# Smaller batch size to reduce memory usage
-BATCH_SIZE = 3
-
 # Base directory for temporary files
 TEMP_BASE_DIR = "/tmp/s3_processor"
-
-# Cap max rows in memory for streaming operations
-MAX_ROWS_IN_MEMORY = 500000
 
 
 def get_s3_client():
@@ -92,25 +86,8 @@ def clean_temp_dir(temp_dir):
         logger.warning(f"Failed to clean up directory {temp_dir}: {str(e)}")
 
 
-def get_schema_from_file(s3_client, file):
-    """Get schema from a file to use for lazy processing"""
-    temp_file = os.path.join("/tmp", os.path.basename(file))
-    try:
-        s3_client.download_file(download_bucket, file, temp_file)
-        # Just read the first few rows to get schema
-        df = pl.scan_csv(temp_file, infer_schema_length=100)
-        schema = df.collect(100).schema
-        os.remove(temp_file)
-        return schema
-    except Exception as e:
-        logger.error(f"Failed to get schema from {file}: {str(e)}")
-        if os.path.exists(temp_file):
-            os.remove(temp_file)
-        return None
-
-
-def stream_process_file(s3_client, file, output_dir, file_counter, schema=None):
-    """Stream process a single file using lazy evaluation"""
+def process_single_file(s3_client, file, output_dir, file_counter):
+    """Process a single file and convert to parquet for merge"""
     download_path = os.path.join(output_dir, f"download_{file_counter}.csv")
     output_path = os.path.join(output_dir, f"processed_{file_counter}.parquet")
 
@@ -119,23 +96,19 @@ def stream_process_file(s3_client, file, output_dir, file_counter, schema=None):
         s3_client.download_file(download_bucket, file, download_path)
         logger.info(f"Downloaded {file} to {download_path}")
 
-        # Process using lazy evaluation
-        if schema:
-            df_lazy = pl.scan_csv(download_path, schema=schema)
-        else:
-            df_lazy = pl.scan_csv(download_path)
-
-        # Sort by all columns to prepare for deduplication
-        df_lazy = df_lazy.sort(by=df_lazy.columns)
+        # Read the CSV file with regular (non-lazy) evaluation
+        # This avoids issues with the streaming engine deprecation
+        df = pl.read_csv(download_path)
 
         # Write to parquet (more efficient storage)
-        df_lazy.sink_parquet(output_path)
+        df.write_parquet(output_path)
 
         # Clean up CSV file immediately
         os.remove(download_path)
         logger.info(f"Processed {file} and saved to {output_path}")
 
         # Force garbage collection
+        del df
         gc.collect()
 
         return output_path
@@ -146,8 +119,8 @@ def stream_process_file(s3_client, file, output_dir, file_counter, schema=None):
         return None
 
 
-def external_merge_sort(parquet_files, output_dir, year_month):
-    """Perform external merge sort on parquet files with deduplication"""
+def batch_and_deduplicate(parquet_files, output_dir, year_month, batch_size=5):
+    """Process parquet files in batches to deduplicate"""
     if not parquet_files:
         logger.error("No files to merge")
         return None
@@ -157,60 +130,70 @@ def external_merge_sort(parquet_files, output_dir, year_month):
 
     # If there's just one file, convert it directly
     if len(parquet_files) == 1:
-        df = pl.scan_parquet(parquet_files[0]).collect()
+        df = pl.read_parquet(parquet_files[0])
+        df = df.unique()
         df.write_csv(final_output)
         os.remove(parquet_files[0])
         return final_output
 
-    logger.info(f"Beginning external merge sort for {len(parquet_files)} files")
+    logger.info(f"Beginning batch deduplication for {len(parquet_files)} files")
 
-    # Process in pairs to reduce memory usage
-    while len(parquet_files) > 1:
-        new_parquet_files = []
+    # Process in small batches
+    result_file = None
+    current_batch = []
 
-        # Process files in pairs
-        for i in range(0, len(parquet_files), 2):
-            if i + 1 < len(parquet_files):
-                # We have a pair
-                file1 = parquet_files[i]
-                file2 = parquet_files[i + 1]
+    for i, file in enumerate(parquet_files):
+        current_batch.append(file)
 
-                merge_output = os.path.join(output_dir, f"merge_{i}_{uuid.uuid4().hex[:8]}.parquet")
+        # When we reach batch size or the end, process the batch
+        if len(current_batch) >= batch_size or i == len(parquet_files) - 1:
+            logger.info(f"Processing batch of {len(current_batch)} files")
 
-                # Use lazy evaluation for merging
-                df1_lazy = pl.scan_parquet(file1)
-                df2_lazy = pl.scan_parquet(file2)
+            # Load and concatenate this batch
+            batch_dfs = [pl.read_parquet(f) for f in current_batch]
+            batch_df = pl.concat(batch_dfs)
 
-                # Concatenate and remove duplicates
-                (
-                    pl.concat([df1_lazy, df2_lazy])
-                    .unique()
-                    .sink_parquet(merge_output)
-                )
+            # Deduplicate the batch
+            batch_df = batch_df.unique()
 
-                # Clean up input files
-                os.remove(file1)
-                os.remove(file2)
+            # If we have a result from a previous batch, merge with it
+            if result_file:
+                previous_df = pl.read_parquet(result_file)
+                combined_df = pl.concat([previous_df, batch_df])
+                combined_df = combined_df.unique()
 
-                # Add merged file to new list
-                new_parquet_files.append(merge_output)
+                # Write the result
+                temp_result = os.path.join(output_dir, f"result_{i}.parquet")
+                combined_df.write_parquet(temp_result)
 
-                # Force garbage collection
+                # Clean up
+                os.remove(result_file)
+                result_file = temp_result
+
+                # Clear memory
+                del previous_df
+                del combined_df
                 gc.collect()
-
             else:
-                # Odd number of files, just add the last one
-                new_parquet_files.append(parquet_files[i])
+                # First batch, just save it
+                result_file = os.path.join(output_dir, f"result_{i}.parquet")
+                batch_df.write_parquet(result_file)
 
-        # Update our file list for next iteration
-        parquet_files = new_parquet_files
-        logger.info(f"Merge iteration complete, now have {len(parquet_files)} files")
+            # Clean up batch files and memory
+            for f in current_batch:
+                os.remove(f)
+            del batch_dfs
+            del batch_df
+            gc.collect()
 
-    # Final output conversion from parquet to csv
-    if parquet_files:
-        df = pl.scan_parquet(parquet_files[0]).collect()
+            # Reset for next batch
+            current_batch = []
+
+    # Convert final result to CSV
+    if result_file:
+        df = pl.read_parquet(result_file)
         df.write_csv(final_output)
-        os.remove(parquet_files[0])
+        os.remove(result_file)
 
         logger.info(f"Created final combined file {final_output} with {len(df)} rows")
         return final_output
@@ -219,32 +202,29 @@ def external_merge_sort(parquet_files, output_dir, year_month):
 
 
 def process_year_month_streaming(year_month, files):
-    """Process files for a year-month using streaming to minimize memory usage"""
+    """Process files for a year-month in batches to minimize memory usage"""
     temp_dir = create_temp_dir()
     logger.info(f"Processing {len(files)} files for {year_month} in directory {temp_dir}")
 
     try:
         s3_client = get_s3_client()
 
-        # Get schema from first file to use for all files
-        schema = get_schema_from_file(s3_client, files[0]) if files else None
-
-        # Process files individually to parquet format
+        # Process each file individually to parquet format
         parquet_files = []
         for i, file in enumerate(files):
             # Log progress
-            if i % 5 == 0:
+            if i % 10 == 0:
                 logger.info(f"Processing file {i + 1}/{len(files)} for {year_month}")
 
-            parquet_file = stream_process_file(s3_client, file, temp_dir, i, schema)
+            parquet_file = process_single_file(s3_client, file, temp_dir, i)
             if parquet_file:
                 parquet_files.append(parquet_file)
 
             # Force garbage collection
             gc.collect()
 
-        # Merge the parquet files with external merge sort
-        final_output = external_merge_sort(parquet_files, temp_dir, year_month)
+        # Merge and deduplicate in batches
+        final_output = batch_and_deduplicate(parquet_files, temp_dir, year_month, batch_size=3)
 
         if final_output:
             # Upload the final result to S3
