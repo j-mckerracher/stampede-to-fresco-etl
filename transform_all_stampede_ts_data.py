@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 # Initialize the S3 client
 s3_client = boto3.client(
     's3',
-
     region_name='us-east-1'
 )
 
