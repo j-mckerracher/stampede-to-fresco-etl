@@ -23,9 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Modified paths for the distributed approach
-source_dir = r"U:\projects\stampede-to-fresco-etl\cache\input"
-complete_dir = r"U:\projects\stampede-to-fresco-etl\cache\complete"
-cache_base_dir = r"U:\projects\stampede-to-fresco-etl\cache\processing"
+source_dir = r"/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache/input"
+complete_dir = r"/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache/complete"
+cache_base_dir = r"/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache"
 
 # Resource management configurations
 MAX_MEMORY_PERCENT = 70  # Cap memory usage at 70%
