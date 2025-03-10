@@ -1,64 +1,88 @@
 import os
 import logging
 import re
+import json
 from collections import defaultdict
 import polars as pl
 from pathlib import Path
 from tqdm import tqdm
 import shutil
-import concurrent.futures
 import psutil
 import time
 import uuid
-import csv
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("server_processor.log"),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# Local file paths instead of S3 buckets
-source_dir = r"P:\Stampede\stampede-ts-to-fresco-ts-chunks-1"
-destination_dir = r"P:\Stampede\stampede-ts-fresco-form-daily-2"
-
-# Already processed year-month combinations to skip
-processed_year_months = [
-    "2013-02", "2013-03", "2013-04", "2013-05",
-    "2013-06", "2013-07", "2013-08", "2013-09"
-]
+# Modified paths for the distributed approach
+source_dir = r"U:\projects\stampede-to-fresco-etl\cache\input"
+complete_dir = r"U:\projects\stampede-to-fresco-etl\cache\complete"
+cache_base_dir = r"U:\projects\stampede-to-fresco-etl\cache\processing"
 
 # Resource management configurations
-MAX_WORKERS = max(1, psutil.cpu_count(logical=False) - 1)  # Use physical cores - 1
 MAX_MEMORY_PERCENT = 70  # Cap memory usage at 70%
+
+# Status file to track process state
+STATUS_FILE = os.path.join(cache_base_dir, "processing_status.json")
+
+
+def save_status(job_id, status, details=None):
+    """Save processing status to a file that can be read by the laptop script"""
+    status_path = os.path.join(complete_dir, f"{job_id}.status")
+
+    status_data = {
+        "job_id": job_id,
+        "status": status,
+        "timestamp": time.time(),
+        "details": details or {}
+    }
+
+    with open(status_path, 'w') as f:
+        json.dump(status_data, f)
+
+    logger.info(f"Status update for job {job_id}: {status}")
 
 
 def list_source_files():
-    """List all files in the source directory"""
-    files = []
+    """List all job files in the source directory"""
+    manifest_files = []
+    data_files = []
+
+    # First look for manifest files
     for root, _, filenames in os.walk(source_dir):
         for filename in filenames:
-            if filename.endswith('.parquet'):
-                rel_path = os.path.relpath(os.path.join(root, filename), source_dir)
-                files.append(rel_path)
-    return files
+            full_path = os.path.join(root, filename)
+            if filename.endswith('.manifest.json'):
+                manifest_files.append(full_path)
+            elif filename.endswith('.parquet'):
+                data_files.append(full_path)
+
+    return manifest_files, data_files
 
 
-def get_year_month_combos(files_list):
-    """Group files by year-month"""
-    files_by_year_month = defaultdict(list)
+def load_job_from_manifest(manifest_path):
+    """Load job information from manifest file"""
+    try:
+        with open(manifest_path, 'r') as f:
+            manifest = json.load(f)
 
-    for file in files_list:
-        # Extract year-month from filename using regex
-        match = re.search(r'node_data_(\d{4}-\d{2})\.parquet$', file)
-        if match:
-            year_month = match.group(1)
-            # Skip already processed year-months
-            if year_month not in processed_year_months:
-                files_by_year_month[year_month].append(file)
+        job_id = manifest.get('job_id')
+        year_month = manifest.get('year_month')
+        files = manifest.get('files', [])
 
-    return files_by_year_month
+        logger.info(f"Loaded job {job_id} for {year_month} with {len(files)} files")
+        return job_id, year_month, files
+    except Exception as e:
+        logger.error(f"Error loading manifest {manifest_path}: {str(e)}")
+        return None, None, []
 
 
 def move_data_into_day_dataframe(df):
@@ -212,24 +236,25 @@ def convert_csv_to_parquet(csv_file, parquet_file):
         return False
 
 
-def copy_file_to_destination(file_path, destination_bucket):
+def copy_file_to_complete_dir(file_path, job_id):
     """
-    Copies a single file to the destination directory.
+    Copies a processed file to the complete directory.
     """
-    # The input is a CSV file, but we want to store as parquet in the destination
+    # Create a job-specific directory in the complete dir
+    job_complete_dir = os.path.join(complete_dir, job_id)
+    os.makedirs(job_complete_dir, exist_ok=True)
+
+    # The input is a CSV file, but we want to store as parquet
     file_name = os.path.basename(file_path)
     if file_name.endswith('.csv'):
         parquet_name = file_name.replace('.csv', '.parquet')
     else:
         parquet_name = file_name + '.parquet'
 
-    dest_path = os.path.join(destination_bucket, parquet_name)
+    dest_path = os.path.join(job_complete_dir, parquet_name)
 
     try:
-        # Ensure destination directory exists
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-
-        # If the source is a CSV, convert it to parquet first
+        # If the source is a CSV, convert it to parquet
         if file_path.endswith('.csv'):
             if convert_csv_to_parquet(file_path, dest_path):
                 logger.debug(f"Converted and copied {file_path} to {dest_path}")
@@ -238,7 +263,7 @@ def copy_file_to_destination(file_path, destination_bucket):
                 logger.error(f"Failed to convert {file_path} to parquet")
                 return False
         else:
-            # Direct copy for non-CSV files (shouldn't happen in this flow)
+            # Direct copy for non-CSV files
             shutil.copy2(file_path, dest_path)
             logger.debug(f"Copied {file_path} to {dest_path}")
             return True
@@ -247,26 +272,23 @@ def copy_file_to_destination(file_path, destination_bucket):
         return False
 
 
-def process_file(file, year_month, cache_dir):
+def process_file(file_path, year_month, cache_dir):
     """Process a single file"""
     try:
-        # Build full path to source file
-        source_file_path = os.path.join(source_dir, file)
-
         # Process file
-        logger.debug(f"Processing {file}")
-        daily_files = process_downloaded_file(source_file_path, year_month, cache_dir)
+        logger.debug(f"Processing {file_path}")
+        daily_files = process_downloaded_file(file_path, year_month, cache_dir)
 
         return daily_files
     except Exception as e:
-        logger.error(f"Error processing file {file}: {str(e)}")
+        logger.error(f"Error processing file {file_path}: {str(e)}")
         return set()
 
 
-def process_year_month(year_month, files):
-    """Process all files for a given year-month combination"""
-    # Create cache directory for this year-month
-    cache_dir = Path(f"cache/{year_month}")
+def process_job(job_id, year_month, files):
+    """Process all files for a given job"""
+    # Create cache directory for this job
+    cache_dir = Path(f"{cache_base_dir}/{job_id}/{year_month}")
     cache_dir.mkdir(exist_ok=True, parents=True)
 
     # Set for collecting daily files
@@ -278,41 +300,78 @@ def process_year_month(year_month, files):
         return memory_percent < MAX_MEMORY_PERCENT
 
     # Process files sequentially to avoid corruption
-    logger.info(f"Processing {len(files)} files for {year_month}")
-    with tqdm(total=len(files), desc=f"Processing files for {year_month}") as file_pbar:
-        # Process files in smaller batches to control memory usage
-        batch_size = 5  # Small batch size for better control
+    logger.info(f"Processing {len(files)} files for job {job_id} (year-month: {year_month})")
 
-        for i in range(0, len(files), batch_size):
-            # Wait if memory usage is too high
-            while not memory_ok():
-                logger.warning(f"Memory usage high ({psutil.virtual_memory().percent}%). Waiting...")
-                time.sleep(5)
+    # Update status to processing
+    save_status(job_id, "processing", {"total_files": len(files), "processed_files": 0})
 
-            batch = files[i:i + batch_size]
+    # Process files in smaller batches to control memory usage
+    batch_size = 5  # Small batch size for better control
+    processed_count = 0
 
-            # Process this batch sequentially
-            for file in batch:
+    for i in range(0, len(files), batch_size):
+        # Wait if memory usage is too high
+        while not memory_ok():
+            logger.warning(f"Memory usage high ({psutil.virtual_memory().percent}%). Waiting...")
+            time.sleep(5)
+
+        batch = files[i:i + batch_size]
+        batch_paths = [os.path.join(source_dir, f) for f in batch if os.path.exists(os.path.join(source_dir, f))]
+
+        # Process this batch sequentially
+        for file_path in batch_paths:
+            try:
+                new_daily_files = process_file(file_path, year_month, cache_dir)
+                for daily_file in new_daily_files:
+                    daily_files_dict[str(daily_file)] = daily_file
+
+                # Delete the processed input file
                 try:
-                    new_daily_files = process_file(file, year_month, cache_dir)
-                    for daily_file in new_daily_files:
-                        daily_files_dict[str(daily_file)] = daily_file
+                    os.remove(file_path)
+                    logger.debug(f"Deleted processed input file: {file_path}")
                 except Exception as e:
-                    logger.error(f"Error processing file {file}: {str(e)}")
+                    logger.error(f"Error deleting input file {file_path}: {str(e)}")
 
-                file_pbar.update(1)
+                processed_count += 1
+
+                # Update status periodically
+                if processed_count % 10 == 0 or processed_count == len(files):
+                    save_status(job_id, "processing", {
+                        "total_files": len(files),
+                        "processed_files": processed_count,
+                        "percent_complete": round((processed_count / len(files)) * 100, 2)
+                    })
+            except Exception as e:
+                logger.error(f"Error processing file {file_path}: {str(e)}")
 
     # Convert to list for progress tracking
     daily_files_list = list(daily_files_dict.values())
 
-    # Copy all daily files to destination
-    logger.info(f"Converting and copying {len(daily_files_list)} CSV files to parquet in destination")
+    # Copy all daily files to the complete directory
+    logger.info(f"Converting and copying {len(daily_files_list)} CSV files to parquet in complete directory")
     copied_files = []
-    with tqdm(total=len(daily_files_list), desc=f"Copying files for {year_month}") as copy_pbar:
-        for file_path in daily_files_list:
-            if copy_file_to_destination(str(file_path), destination_dir):
-                copied_files.append(file_path)
-            copy_pbar.update(1)
+
+    for file_path in daily_files_list:
+        if copy_file_to_complete_dir(str(file_path), job_id):
+            copied_files.append(file_path)
+
+    # Create a manifest of completed files
+    manifest_data = {
+        "job_id": job_id,
+        "year_month": year_month,
+        "total_files_processed": processed_count,
+        "days_processed": len(daily_files_list),
+        "files_copied": len(copied_files),
+        "timestamp": time.time()
+    }
+
+    # Write the manifest to the complete directory
+    manifest_path = os.path.join(complete_dir, f"{job_id}.manifest.json")
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest_data, f)
+
+    # Update final status
+    save_status(job_id, "completed", manifest_data)
 
     # Remove daily files after copying
     logger.info("Cleaning up daily files")
@@ -323,73 +382,18 @@ def process_year_month(year_month, files):
         except Exception as e:
             logger.error(f"Error removing cache file {file_path}: {str(e)}")
 
+    # Remove the job cache directory
+    try:
+        shutil.rmtree(os.path.join(cache_base_dir, job_id))
+        logger.info(f"Cleaned up job cache directory for {job_id}")
+    except Exception as e:
+        logger.error(f"Error cleaning up job cache: {str(e)}")
+
     # Return success status and counts
     return {
+        "job_id": job_id,
         "year_month": year_month,
-        "files_processed": len(files),
+        "files_processed": processed_count,
         "days_processed": len(daily_files_list),
         "files_copied": len(copied_files)
     }
-
-
-def main():
-    start_time = time.time()
-
-    # 1. Create temp directories
-    for dir_path in ["cache"]:
-        os.makedirs(dir_path, exist_ok=True)
-
-    # Ensure destination directory exists
-    os.makedirs(destination_dir, exist_ok=True)
-
-    # 2. Clear any existing cache to start fresh
-    try:
-        logger.info("Cleaning any existing cache files to start fresh")
-        for root, dirs, files in os.walk("cache"):
-            for file in files:
-                if file.endswith(".parquet") or file.endswith(".csv"):
-                    os.remove(os.path.join(root, file))
-    except Exception as e:
-        logger.error(f"Error cleaning existing cache: {str(e)}")
-
-    # 3. List all files in the source directory
-    logger.info("Listing files in source directory...")
-    files_list = list_source_files()
-    logger.info(f"Found {len(files_list)} files in source directory")
-
-    # 4. Group files by year-month
-    logger.info("Grouping files by year-month...")
-    year_month_combos = get_year_month_combos(files_list)
-    logger.info(f"Found {len(year_month_combos)} year-month combinations to process")
-
-    # Skip if no new combinations to process
-    if not year_month_combos:
-        logger.info("No new year-month combinations to process. Exiting.")
-        return
-
-    # 5. Process each year-month combination
-    results = []
-    with tqdm(total=len(year_month_combos), desc="Processing year-month combinations") as ym_pbar:
-        for year_month, files in year_month_combos.items():
-            logger.info(f"Starting processing for {year_month} with {len(files)} files")
-            result = process_year_month(year_month, files)
-            results.append(result)
-            ym_pbar.update(1)
-
-    # 6. Summarize results
-    total_runtime = time.time() - start_time
-    logger.info(f"Processing complete in {total_runtime:.2f} seconds. Summary:")
-    for result in results:
-        logger.info(f"{result['year_month']}: Processed {result['files_processed']} files, "
-                    f"created {result['days_processed']} daily files, copied {result['files_copied']} files")
-
-    # 7. Clean up temporary directories
-    try:
-        shutil.rmtree("cache")
-        logger.info("Cleaned up temporary directories")
-    except Exception as e:
-        logger.error(f"Error cleaning up temporary directories: {str(e)}")
-
-
-if __name__ == "__main__":
-    main()
