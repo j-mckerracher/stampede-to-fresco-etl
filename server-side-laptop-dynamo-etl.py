@@ -397,3 +397,106 @@ def process_job(job_id, year_month, files):
         "days_processed": len(daily_files_list),
         "files_copied": len(copied_files)
     }
+
+
+def main():
+    """Main function to run the server processor"""
+    logger.info("Starting server processor")
+
+    # Ensure directories exist
+    os.makedirs(source_dir, exist_ok=True)
+    os.makedirs(complete_dir, exist_ok=True)
+    os.makedirs(cache_base_dir, exist_ok=True)
+
+    try:
+        # Find source files
+        manifest_files, data_files = list_source_files()
+
+        if not manifest_files and not data_files:
+            logger.info("No files to process. Exiting.")
+            return
+
+        logger.info(f"Found {len(manifest_files)} manifest files and {len(data_files)} data files")
+
+        # Process each manifest file
+        for manifest_path in manifest_files:
+            try:
+                # Load job information from manifest
+                job_id, year_month, files = load_job_from_manifest(manifest_path)
+
+                if not job_id or not year_month or not files:
+                    logger.warning(f"Invalid manifest file: {manifest_path}. Skipping.")
+                    continue
+
+                # Process this job
+                logger.info(f"Processing job {job_id} for {year_month}")
+                result = process_job(job_id, year_month, files)
+
+                logger.info(f"Job {job_id} completed: {result}")
+
+                # Move the manifest file to complete directory
+                try:
+                    manifest_filename = os.path.basename(manifest_path)
+                    shutil.move(manifest_path, os.path.join(complete_dir, manifest_filename))
+                    logger.info(f"Moved manifest {manifest_filename} to complete directory")
+                except Exception as e:
+                    logger.error(f"Error moving manifest file: {str(e)}")
+
+            except Exception as e:
+                logger.error(f"Error processing manifest {manifest_path}: {str(e)}")
+
+                # Try to update status to failed
+                try:
+                    job_id = os.path.basename(manifest_path).split('.')[0]
+                    save_status(job_id, "failed", {"error": str(e)})
+                except Exception as status_err:
+                    logger.error(f"Error saving failed status: {str(status_err)}")
+
+        # Process any standalone data files
+        if data_files:
+            logger.info(f"Processing {len(data_files)} standalone data files")
+
+            # Create a default job ID for these files
+            default_job_id = f"standalone_{int(time.time())}"
+
+            # Try to extract year-month from filenames
+            # Assuming standard format like "data_2023-05_something.parquet"
+            year_month_pattern = re.compile(r'(\d{4}-\d{2})')
+            year_months = {}
+
+            for file_path in data_files:
+                filename = os.path.basename(file_path)
+                match = year_month_pattern.search(filename)
+
+                if match:
+                    year_month = match.group(1)
+                else:
+                    # Default to current year-month if pattern not found
+                    current_time = time.localtime()
+                    year_month = f"{current_time.tm_year}-{current_time.tm_mon:02d}"
+
+                if year_month not in year_months:
+                    year_months[year_month] = []
+
+                year_months[year_month].append(os.path.relpath(file_path, source_dir))
+
+            # Process each year-month group
+            for year_month, files in year_months.items():
+                job_id = f"{default_job_id}_{year_month}"
+                logger.info(f"Processing standalone job {job_id} with {len(files)} files")
+
+                try:
+                    result = process_job(job_id, year_month, files)
+                    logger.info(f"Standalone job {job_id} completed: {result}")
+                except Exception as e:
+                    logger.error(f"Error processing standalone job {job_id}: {str(e)}")
+                    save_status(job_id, "failed", {"error": str(e)})
+
+    except Exception as e:
+        logger.error(f"Unhandled exception in main function: {str(e)}")
+
+    logger.info("Server processor completed")
+
+
+if __name__ == "__main__":
+    main()
