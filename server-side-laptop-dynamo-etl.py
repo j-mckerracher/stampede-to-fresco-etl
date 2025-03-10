@@ -124,68 +124,68 @@ def move_data_into_day_dataframe(df):
     return day_dataframes
 
 
-def append_to_daily_csv(day_df, day, year_month, cache_dir):
+def append_to_daily_parquet(day_df, day, year_month, cache_dir):
     """
-    Append data to a daily CSV file, creating if it doesn't exist.
-    Handles deduplication using a safer approach by working with CSV.
+    Append data to a daily Parquet file, creating if it doesn't exist.
+    Handles deduplication using a safer approach by working with Parquet.
     """
     # Format day as two digits
     day_str = f"{day:02d}"
 
-    # Define output file path for CSV (intermediate storage)
-    csv_file = cache_dir / f"perf_metrics_{year_month}-{day_str}.csv"
+    # Define output file path for Parquet
+    parquet_file = cache_dir / f"perf_metrics_{year_month}-{day_str}.parquet"
 
     # Generate a unique temporary file path
-    temp_csv_file = cache_dir / f"temp_{uuid.uuid4().hex}_{year_month}-{day_str}.csv"
+    temp_parquet_file = cache_dir / f"temp_{uuid.uuid4().hex}_{year_month}-{day_str}.parquet"
 
     try:
-        # Convert day_df to CSV for easier handling
-        day_df.write_csv(temp_csv_file)
+        # Write day_df to temporary Parquet file
+        day_df.write_parquet(temp_parquet_file)
 
-        # If the output CSV file already exists, we need to merge and deduplicate
-        if csv_file.exists():
+        # If the output Parquet file already exists, we need to merge and deduplicate
+        if parquet_file.exists():
             try:
                 # Create a new file that will contain the merged data
-                merged_csv_file = cache_dir / f"merged_{uuid.uuid4().hex}_{year_month}-{day_str}.csv"
+                merged_parquet_file = cache_dir / f"merged_{uuid.uuid4().hex}_{year_month}-{day_str}.parquet"
 
-                # Read both CSVs into DataFrames
-                existing_df = pl.read_csv(csv_file)
-                new_df = pl.read_csv(temp_csv_file)
+                # Read both Parquet files into DataFrames
+                existing_df = pl.read_parquet(parquet_file)
+                new_df = pl.read_parquet(temp_parquet_file)
 
                 # Combine and deduplicate
                 merged_df = pl.concat([existing_df, new_df]).unique()
 
                 # Write to a new file
-                merged_df.write_csv(merged_csv_file)
+                merged_df.write_parquet(merged_parquet_file)
 
                 # Replace the old file with the merged file
-                os.replace(merged_csv_file, csv_file)
+                os.replace(merged_parquet_file, parquet_file)
 
                 # Cleanup the temporary file
-                os.remove(temp_csv_file)
+                os.remove(temp_parquet_file)
 
-                logger.debug(f"Updated file {csv_file} with {len(merged_df)} unique rows")
+                logger.debug(f"Updated file {parquet_file} with {len(merged_df)} unique rows")
             except Exception as e:
-                logger.error(f"Error merging CSV files: {str(e)}")
+                logger.error(f"Error merging Parquet files: {str(e)}")
                 # If merging fails, just use the new data (don't lose it)
-                os.replace(temp_csv_file, csv_file)
+                os.replace(temp_parquet_file, parquet_file)
         else:
             # No existing file, just rename the temp file
-            os.rename(temp_csv_file, csv_file)
-            logger.debug(f"Created new file {csv_file} with {len(day_df)} rows")
+            os.rename(temp_parquet_file, parquet_file)
+            logger.debug(f"Created new file {parquet_file} with {len(day_df)} rows")
 
     except Exception as e:
-        logger.error(f"Error in append_to_daily_csv: {str(e)}")
+        logger.error(f"Error in append_to_daily_parquet: {str(e)}")
         # Cleanup any temporary files
-        if os.path.exists(temp_csv_file):
-            os.remove(temp_csv_file)
+        if os.path.exists(temp_parquet_file):
+            os.remove(temp_parquet_file)
 
-    return csv_file
+    return parquet_file
 
 
 def process_downloaded_file(file_path, year_month, cache_dir):
     """
-    Process a single file, split by day, and write to daily CSV files.
+    Process a single file, split by day, and write to daily Parquet files.
     """
     processed_files = set()
 
@@ -200,7 +200,7 @@ def process_downloaded_file(file_path, year_month, cache_dir):
         # Process each day's data
         for day, day_df in df_days.items():
             # Append to daily file
-            daily_file = append_to_daily_csv(day_df, day, year_month, cache_dir)
+            daily_file = append_to_daily_parquet(day_df, day, year_month, cache_dir)
             processed_files.add(daily_file)
             del day_df  # Release memory
 
@@ -210,63 +210,28 @@ def process_downloaded_file(file_path, year_month, cache_dir):
     return processed_files
 
 
-def convert_csv_to_parquet(csv_file, parquet_file):
-    """
-    Converts a CSV file to a Parquet file with validation.
-    """
-    try:
-        # Read the CSV file
-        df = pl.read_csv(csv_file)
-
-        # Write to a temporary parquet file first
-        temp_parquet = str(parquet_file) + ".temp"
-        df.write_parquet(temp_parquet)
-
-        # Validate the parquet file
-        _ = pl.read_parquet(temp_parquet)
-
-        # If validation passes, rename the file
-        os.replace(temp_parquet, parquet_file)
-        return True
-    except Exception as e:
-        logger.error(f"Error converting CSV to Parquet: {str(e)}")
-        # Cleanup temp file if it exists
-        if os.path.exists(temp_parquet):
-            os.remove(temp_parquet)
-        return False
-
-
 def copy_file_to_complete_dir(file_path, job_id):
     """
-    Copies a processed file to the complete directory.
+    Copies a processed Parquet file to the complete directory.
     """
     # Create a job-specific directory in the complete dir
     job_complete_dir = os.path.join(complete_dir, job_id)
     os.makedirs(job_complete_dir, exist_ok=True)
 
-    # The input is a CSV file, but we want to store as parquet
+    # Get the file name
     file_name = os.path.basename(file_path)
-    if file_name.endswith('.csv'):
-        parquet_name = file_name.replace('.csv', '.parquet')
-    else:
-        parquet_name = file_name + '.parquet'
 
-    dest_path = os.path.join(job_complete_dir, parquet_name)
+    # Ensure it has a .parquet extension
+    if not file_name.endswith('.parquet'):
+        file_name = file_name + '.parquet'
+
+    dest_path = os.path.join(job_complete_dir, file_name)
 
     try:
-        # If the source is a CSV, convert it to parquet
-        if file_path.endswith('.csv'):
-            if convert_csv_to_parquet(file_path, dest_path):
-                logger.debug(f"Converted and copied {file_path} to {dest_path}")
-                return True
-            else:
-                logger.error(f"Failed to convert {file_path} to parquet")
-                return False
-        else:
-            # Direct copy for non-CSV files
-            shutil.copy2(file_path, dest_path)
-            logger.debug(f"Copied {file_path} to {dest_path}")
-            return True
+        # Copy the Parquet file
+        shutil.copy2(file_path, dest_path)
+        logger.debug(f"Copied {file_path} to {dest_path}")
+        return True
     except Exception as e:
         logger.error(f"Error copying {file_path} to {dest_path}: {str(e)}")
         return False
@@ -348,7 +313,7 @@ def process_job(job_id, year_month, files):
     daily_files_list = list(daily_files_dict.values())
 
     # Copy all daily files to the complete directory
-    logger.info(f"Converting and copying {len(daily_files_list)} CSV files to parquet in complete directory")
+    logger.info(f"Copying {len(daily_files_list)} Parquet files to complete directory")
     copied_files = []
 
     for file_path in daily_files_list:
