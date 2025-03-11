@@ -77,12 +77,13 @@ def load_job_from_manifest(manifest_path):
         job_id = manifest.get('job_id')
         year_month = manifest.get('year_month')
         files = manifest.get('files', [])
+        complete_month = manifest.get('complete_month', False)
 
-        logger.info(f"Loaded job {job_id} for {year_month} with {len(files)} files")
-        return job_id, year_month, files
+        logger.info(f"Loaded job {job_id} for {year_month} with {len(files)} files, complete_month: {complete_month}")
+        return job_id, year_month, files, complete_month
     except Exception as e:
         logger.error(f"Error loading manifest {manifest_path}: {str(e)}")
-        return None, None, []
+        return None, None, [], False
 
 
 def move_data_into_day_dataframe(df):
@@ -327,6 +328,7 @@ def process_job(job_id, year_month, files):
         "total_files_processed": processed_count,
         "days_processed": len(daily_files_list),
         "files_copied": len(copied_files),
+        "complete_month": True,  # Indicate this was a complete month job
         "timestamp": time.time()
     }
 
@@ -336,7 +338,14 @@ def process_job(job_id, year_month, files):
         json.dump(manifest_data, f)
 
     # Update final status
-    save_status(job_id, "completed", manifest_data)
+    save_status(job_id, "completed", {
+        "year_month": year_month,
+        "total_files_processed": processed_count,
+        "days_processed": len(daily_files_list),
+        "files_copied": len(copied_files),
+        "complete_month": True,  # Indicate this was a complete month job
+        "ready_for_final_destination": True  # Signal ETL manager to move data
+    })
 
     # Remove daily files after copying
     logger.info("Cleaning up daily files")
@@ -360,7 +369,8 @@ def process_job(job_id, year_month, files):
         "year_month": year_month,
         "files_processed": processed_count,
         "days_processed": len(daily_files_list),
-        "files_copied": len(copied_files)
+        "files_copied": len(copied_files),
+        "complete_month": True
     }
 
 
@@ -388,18 +398,24 @@ def main():
 
             logger.info(f"Found {len(manifest_files)} manifest files and {len(data_files)} data files")
 
-            # Process each manifest file
+            # Process only one manifest file at a time that has complete_month=True
+            active_job = False
             for manifest_path in manifest_files:
                 try:
                     # Load job information from manifest
-                    job_id, year_month, files = load_job_from_manifest(manifest_path)
+                    job_id, year_month, files, complete_month = load_job_from_manifest(manifest_path)
 
                     if not job_id or not year_month or not files:
                         logger.warning(f"Invalid manifest file: {manifest_path}. Skipping.")
                         continue
 
+                    # Only process jobs with complete_month=True
+                    if not complete_month:
+                        logger.info(f"Job {job_id} for {year_month} is not marked as complete month. Skipping.")
+                        continue
+
                     # Process this job
-                    logger.info(f"Processing job {job_id} for {year_month}")
+                    logger.info(f"Processing job {job_id} for {year_month} (complete month data)")
                     result = process_job(job_id, year_month, files)
 
                     logger.info(f"Job {job_id} completed: {result}")
@@ -412,6 +428,10 @@ def main():
                     except Exception as e:
                         logger.error(f"Error moving manifest file: {str(e)}")
 
+                    # Set active_job to True and break to process only one job
+                    active_job = True
+                    break
+
                 except Exception as e:
                     logger.error(f"Error processing manifest {manifest_path}: {str(e)}")
 
@@ -422,47 +442,16 @@ def main():
                     except Exception as status_err:
                         logger.error(f"Error saving failed status: {str(status_err)}")
 
-            # Process any standalone data files
+            # If we've processed a job, continue to the next loop iteration
+            if active_job:
+                logger.info("Completed processing a job. Checking for more jobs.")
+                continue
+
+            # Don't process standalone data files as they should be processed by the ETL manager
+            # and put into a complete month job
             if data_files:
-                logger.info(f"Processing {len(data_files)} standalone data files")
-
-                # Create a default job ID for these files
-                default_job_id = f"standalone_{int(time.time())}"
-
-                # Try to extract year-month from filenames
-                # Assuming standard format like "data_2023-05_something.parquet"
-                year_month_pattern = re.compile(r'(\d{4}-\d{2})')
-                year_months = {}
-
-                for file_path in data_files:
-                    filename = os.path.basename(file_path)
-                    match = year_month_pattern.search(filename)
-
-                    if match:
-                        year_month = match.group(1)
-                    else:
-                        # Default to current year-month if pattern not found
-                        current_time = time.localtime()
-                        year_month = f"{current_time.tm_year}-{current_time.tm_mon:02d}"
-
-                    if year_month not in year_months:
-                        year_months[year_month] = []
-
-                    year_months[year_month].append(os.path.relpath(file_path, source_dir))
-
-                # Process each year-month group
-                for year_month, files in year_months.items():
-                    job_id = f"{default_job_id}_{year_month}"
-                    logger.info(f"Processing standalone job {job_id} with {len(files)} files")
-
-                    try:
-                        result = process_job(job_id, year_month, files)
-                        logger.info(f"Standalone job {job_id} completed: {result}")
-                    except Exception as e:
-                        logger.error(f"Error processing standalone job {job_id}: {str(e)}")
-                        save_status(job_id, "failed", {"error": str(e)})
-        except Exception as e:
-            logger.error(f"Unhandled exception in main function: {str(e)}")
+                logger.info(
+                    f"Found {len(data_files)} standalone data files but will not process them directly. Waiting for ETL manager to create a proper month job.")
 
             # Sleep for a while before the next iteration
             logger.info("Completed processing cycle. Sleeping before next check.")
@@ -471,6 +460,9 @@ def main():
         except KeyboardInterrupt:
             logger.info("Received interrupt signal. Shutting down gracefully...")
             running = False
+        except Exception as e:
+            logger.error(f"Unhandled exception in main function: {str(e)}")
+            time.sleep(60)  # Check every minute
 
 
 if __name__ == "__main__":
