@@ -1,15 +1,17 @@
 import os
 import logging
-import re
 import json
-from collections import defaultdict
 import polars as pl
 from pathlib import Path
-from tqdm import tqdm
 import shutil
 import psutil
 import time
 import uuid
+import concurrent.futures
+import queue
+import argparse
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 # Set up logging
 logging.basicConfig(
@@ -30,8 +32,14 @@ cache_base_dir = r"/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache
 # Resource management configurations
 MAX_MEMORY_PERCENT = 70  # Cap memory usage at 70%
 
+# Parallel processing configuration
+DEFAULT_NUM_WORKER_THREADS = 4  # Default number of threads
+
 # Status file to track process state
 STATUS_FILE = os.path.join(cache_base_dir, "processing_status.json")
+
+# Global variable for worker threads (will be set in main)
+NUM_WORKER_THREADS = DEFAULT_NUM_WORKER_THREADS
 
 
 def save_status(job_id, status, details=None):
@@ -86,6 +94,45 @@ def load_job_from_manifest(manifest_path):
         return None, None, [], False
 
 
+def process_parquet_row_groups(file_path, year_month, cache_dir, thread_id, start_row_group, end_row_group,
+                               result_queue):
+    """Process a range of row groups from a Parquet file"""
+    try:
+        logger.debug(f"Thread {thread_id} processing row groups {start_row_group} to {end_row_group - 1}")
+
+        # Open the Parquet file
+        parquet_file = pq.ParquetFile(file_path)
+
+        # Read the specified row groups
+        tables = []
+        for row_group_idx in range(start_row_group, end_row_group):
+            table = parquet_file.read_row_group(row_group_idx)
+            tables.append(table)
+
+        # Combine all tables
+        if not tables:
+            logger.warning(f"Thread {thread_id} found no row groups to process")
+            result_queue.put((thread_id, {}))
+            return
+
+        combined_table = pa.concat_tables(tables)
+
+        # Convert to Polars DataFrame
+        df = pl.from_arrow(combined_table)
+
+        # Process the dataframe
+        df_days = move_data_into_day_dataframe(df)
+        del df  # Release memory
+
+        # Return the day dataframes through the queue
+        result_queue.put((thread_id, df_days))
+        logger.debug(f"Thread {thread_id} completed processing row groups")
+
+    except Exception as e:
+        logger.error(f"Error processing row groups in thread {thread_id}: {str(e)}")
+        result_queue.put((thread_id, {}))
+
+
 def move_data_into_day_dataframe(df):
     """
     Group data by day of the month based on Timestamp column.
@@ -123,6 +170,84 @@ def move_data_into_day_dataframe(df):
         day_dataframes[day] = day_df
 
     return day_dataframes
+
+
+def process_downloaded_file_parallel(file_path, year_month, cache_dir, num_threads):
+    """Process a single file using multiple threads based on Parquet row groups"""
+    processed_files = set()
+
+    try:
+        # Log start of processing
+        logger.info(f"Processing {file_path} with {num_threads} threads")
+
+        # Get row group information
+        parquet_file = pq.ParquetFile(file_path)
+        num_row_groups = parquet_file.num_row_groups
+
+        logger.info(f"File has {num_row_groups} row groups")
+
+        # Determine assignment of row groups to threads
+        actual_threads = min(num_threads, num_row_groups)
+        if actual_threads < num_threads:
+            logger.info(f"Using only {actual_threads} threads because there are only {num_row_groups} row groups")
+
+        row_groups_per_thread = max(1, num_row_groups // actual_threads)
+
+        # Create a thread-safe queue for results
+        result_queue = queue.Queue()
+
+        # Use ThreadPoolExecutor to manage threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_threads) as executor:
+            # Submit tasks to the executor
+            futures = []
+
+            for thread_id in range(actual_threads):
+                # Calculate row group range for this thread
+                start_row_group = thread_id * row_groups_per_thread
+                end_row_group = min((thread_id + 1) * row_groups_per_thread, num_row_groups)
+
+                if start_row_group >= num_row_groups:
+                    # No more row groups to process
+                    break
+
+                future = executor.submit(
+                    process_parquet_row_groups,
+                    file_path,
+                    year_month,
+                    cache_dir,
+                    thread_id,
+                    start_row_group,
+                    end_row_group,
+                    result_queue
+                )
+                futures.append(future)
+
+            # Wait for all tasks to complete
+            concurrent.futures.wait(futures)
+
+        # Process all results from the queue
+        daily_dataframes = {}
+        while not result_queue.empty():
+            thread_id, chunk_results = result_queue.get()
+
+            # Merge the chunk results with the overall results
+            for day, day_df in chunk_results.items():
+                if day in daily_dataframes:
+                    # Concatenate dataframes for the same day
+                    daily_dataframes[day] = pl.concat([daily_dataframes[day], day_df])
+                else:
+                    daily_dataframes[day] = day_df
+
+        # Write the combined daily dataframes to files
+        for day, day_df in daily_dataframes.items():
+            # Write the day's data to a parquet file
+            daily_file = append_to_daily_parquet(day_df, day, year_month, cache_dir)
+            processed_files.add(daily_file)
+
+        return processed_files
+    except Exception as e:
+        logger.error(f"Error in parallel processing of file {file_path}: {str(e)}")
+        return set()
 
 
 def append_to_daily_parquet(day_df, day, year_month, cache_dir):
@@ -184,31 +309,17 @@ def append_to_daily_parquet(day_df, day, year_month, cache_dir):
     return parquet_file
 
 
-def process_downloaded_file(file_path, year_month, cache_dir):
-    """
-    Process a single file, split by day, and write to daily Parquet files.
-    """
-    processed_files = set()
-
+def process_file(file_path, year_month, cache_dir):
+    """Process a single file with parallel processing"""
     try:
-        # Memory optimization: Use streaming for large files
-        df = pl.scan_parquet(file_path).collect()
+        # Process file using parallel processing
+        logger.debug(f"Processing {file_path} with {NUM_WORKER_THREADS} threads")
+        daily_files = process_downloaded_file_parallel(file_path, year_month, cache_dir, NUM_WORKER_THREADS)
 
-        # Optimize memory by releasing original dataframe as soon as possible
-        df_days = move_data_into_day_dataframe(df)
-        del df  # Explicitly release memory
-
-        # Process each day's data
-        for day, day_df in df_days.items():
-            # Append to daily file
-            daily_file = append_to_daily_parquet(day_df, day, year_month, cache_dir)
-            processed_files.add(daily_file)
-            del day_df  # Release memory
-
+        return daily_files
     except Exception as e:
         logger.error(f"Error processing file {file_path}: {str(e)}")
-
-    return processed_files
+        return set()
 
 
 def copy_file_to_complete_dir(file_path, job_id):
@@ -236,19 +347,6 @@ def copy_file_to_complete_dir(file_path, job_id):
     except Exception as e:
         logger.error(f"Error copying {file_path} to {dest_path}: {str(e)}")
         return False
-
-
-def process_file(file_path, year_month, cache_dir):
-    """Process a single file"""
-    try:
-        # Process file
-        logger.debug(f"Processing {file_path}")
-        daily_files = process_downloaded_file(file_path, year_month, cache_dir)
-
-        return daily_files
-    except Exception as e:
-        logger.error(f"Error processing file {file_path}: {str(e)}")
-        return set()
 
 
 def process_job(job_id, year_month, files):
@@ -287,7 +385,9 @@ def process_job(job_id, year_month, files):
         # Process this batch sequentially
         for file_path in batch_paths:
             try:
+                # Process file with parallel threads
                 new_daily_files = process_file(file_path, year_month, cache_dir)
+
                 for daily_file in new_daily_files:
                     daily_files_dict[str(daily_file)] = daily_file
 
@@ -376,7 +476,17 @@ def process_job(job_id, year_month, files):
 
 def main():
     """Main function to run the server processor continuously"""
-    logger.info("Starting server processor in continuous mode")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Server processor for ETL pipeline')
+    parser.add_argument('--threads', type=int, default=DEFAULT_NUM_WORKER_THREADS,
+                        help=f'Number of worker threads (default: {DEFAULT_NUM_WORKER_THREADS})')
+    args = parser.parse_args()
+
+    # Set number of worker threads from command line argument
+    global NUM_WORKER_THREADS
+    NUM_WORKER_THREADS = args.threads
+
+    logger.info(f"Starting server processor with {NUM_WORKER_THREADS} worker threads")
 
     # Ensure directories exist
     os.makedirs(source_dir, exist_ok=True)
