@@ -29,7 +29,7 @@ cache_base_dir = r"/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache
 MAX_MEMORY_PERCENT = 70  # Cap memory usage at 70%
 
 # Parallel processing configuration
-DEFAULT_NUM_WORKER_THREADS = 4  # Default number of threads
+DEFAULT_NUM_WORKER_THREADS = 8  # Default number of threads
 
 # Status file to track process state
 STATUS_FILE = os.path.join(cache_base_dir, "processing_status.json")
