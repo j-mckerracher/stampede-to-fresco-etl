@@ -13,10 +13,18 @@ import argparse
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+log_dir = "/home/dynamo/a/jmckerra/projects/stampede-to-fresco-etl/cache/logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "etl_process.log")
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()  # Keep console output as well
+    ]
 )
 logger = logging.getLogger(__name__)
 
