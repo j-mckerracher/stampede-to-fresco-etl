@@ -2,12 +2,27 @@ import os
 import json
 import shutil
 import time
-import uuid
 import logging
 from pathlib import Path
 import polars as pl
-from datetime import datetime, timedelta
+from datetime import timedelta, datetime
 import psutil
+
+
+def print_current_time():
+    # Get the current date and time
+    now = datetime.now()
+
+    # Format the date and time as mm-dd hh:mm:ss
+    formatted_time = now.strftime("%m-%d-%H:%M:%S")
+
+    # Print the formatted string
+    print(formatted_time)
+
+
+log_dir = "/home/dynamo/a/jmckerra/projects/stampede-step-3/logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"{print_current_time()}_start.log")
 
 # Configure logging
 logging.basicConfig(
@@ -20,7 +35,7 @@ SERVER_INPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/input"
 SERVER_OUTPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/output"
 SERVER_COMPLETE_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/complete"
 NUM_THREADS = 20
-MAX_MEMORY_PERCENT = 80  # Maximum memory usage before throttling
+MAX_MEMORY_PERCENT = 80
 
 
 def setup_directories():
