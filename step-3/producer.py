@@ -20,6 +20,7 @@ SERVER_COMPLETE_DIR = r"U:\projects\stampede-step-3\complete"
 DESTINATION_DIR = r"P:\Stampede\stampede-converted-3"
 
 # Active jobs tracking
+MAX_ACTIVE_JOBS = 2
 active_jobs = {}
 
 
@@ -68,11 +69,132 @@ def organize_by_month(metric_files):
     return files_by_month
 
 
+def check_existing_manifests():
+    """Check for existing manifest files in the input directory."""
+    existing_months = set()
+
+    for file in os.listdir(SERVER_INPUT_DIR):
+        if file.endswith(".manifest.json"):
+            try:
+                manifest_path = os.path.join(SERVER_INPUT_DIR, file)
+                with open(manifest_path, 'r') as f:
+                    manifest_data = json.load(f)
+                    year_month = manifest_data.get("year_month")
+                    if year_month:
+                        existing_months.add(year_month)
+                        logger.info(f"Found existing manifest for {year_month}")
+            except Exception as e:
+                logger.error(f"Error reading manifest file {file}: {str(e)}")
+
+    return existing_months
+
+
+def check_active_consumer_jobs():
+    """Check status files in the complete directory to determine jobs the consumer is processing."""
+    active_consumer_jobs = []
+
+    # Look for all status files in the complete directory
+    for file in os.listdir(SERVER_COMPLETE_DIR):
+        if file.endswith(".status"):
+            status_file_path = os.path.join(SERVER_COMPLETE_DIR, file)
+
+            try:
+                with open(status_file_path, 'r') as f:
+                    status_data = json.load(f)
+
+                job_id = status_data.get("job_id")
+                status = status_data.get("status")
+
+                # Check if the job is still being processed (not completed or failed)
+                if status == "processing":
+                    active_consumer_jobs.append(job_id)
+                    logger.info(f"Consumer is actively processing job {job_id}")
+            except Exception as e:
+                logger.error(f"Error reading status file {status_file_path}: {str(e)}")
+
+    logger.info(f"Found {len(active_consumer_jobs)} active consumer jobs")
+    return active_consumer_jobs
+
+
+def cleanup_input_files(job_id):
+    """Clean up original input files for a completed job."""
+    try:
+        # Get the manifest file path
+        manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
+
+        # Check if manifest still exists (it might have been already removed by consumer)
+        if not os.path.exists(manifest_path):
+            logger.info(f"Manifest for job {job_id} already removed, skipping input cleanup")
+            return
+
+        # Load the manifest to get list of files
+        with open(manifest_path, 'r') as f:
+            manifest_data = json.load(f)
+
+        # Get the list of files to clean up
+        metric_files = manifest_data.get("metric_files", [])
+        accounting_files = manifest_data.get("accounting_files", [])
+        all_files = metric_files + accounting_files
+
+        # Delete each input file
+        deleted_count = 0
+        for file_name in all_files:
+            file_path = os.path.join(SERVER_INPUT_DIR, file_name)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                deleted_count += 1
+
+        # Delete the manifest file itself
+        if os.path.exists(manifest_path):
+            os.remove(manifest_path)
+            deleted_count += 1
+
+        logger.info(f"Cleaned up {deleted_count} input files for completed job {job_id}")
+
+    except Exception as e:
+        logger.error(f"Error cleaning up input files for job {job_id}: {str(e)}")
+
+
 def distribute_jobs(files_by_month, accounting_files):
     """Create job manifests and distribute work to server."""
     jobs_created = 0
 
+    # Check how many jobs the consumer is currently processing
+    active_consumer_jobs = check_active_consumer_jobs()
+
+    # Get months that are currently being processed
+    months_in_process = set()
+    for job_id in active_consumer_jobs:
+        # Try to extract month from job ID
+        if job_id.startswith("job_") and len(job_id.split("_")) >= 3:
+            month = job_id.split("_")[1]
+            months_in_process.add(month)
+
+    # Check for existing manifests in the input directory
+    existing_manifests = check_existing_manifests()
+
+    # Combine all months that should be skipped
+    months_to_skip = months_in_process.union(existing_manifests)
+
+    logger.info(f"Months to skip (in process or existing manifests): {months_to_skip}")
+
+    # If the consumer is already at capacity, don't create more jobs
+    total_active_jobs = len(active_consumer_jobs) + len(existing_manifests)
+    if total_active_jobs >= MAX_ACTIVE_JOBS:
+        logger.info(
+            f"Already at maximum capacity with {len(active_consumer_jobs)} active jobs and {len(existing_manifests)} pending jobs. Waiting for completion.")
+        return 0
+
+    # Calculate how many more jobs we can create
+    available_slots = MAX_ACTIVE_JOBS - total_active_jobs
+
+    # Process in order, skipping months that are already in process or have pending manifests
     for year_month, metric_files in files_by_month.items():
+        # Skip if this month is already being processed or has a pending manifest
+        if year_month in months_to_skip:
+            logger.info(f"Month {year_month} is already being processed or has a pending manifest, skipping")
+            continue
+
         # Find matching accounting files
         month_accounting_files = []
         for acc_file in accounting_files:
@@ -117,6 +239,11 @@ def distribute_jobs(files_by_month, accounting_files):
         logger.info(f"Created job {job_id} for {year_month}")
         jobs_created += 1
 
+        # Check if we've reached the available slots limit
+        if jobs_created >= available_slots:
+            logger.info(f"Created {jobs_created} new jobs, reaching the limit of {MAX_ACTIVE_JOBS} total active jobs")
+            break
+
     return jobs_created
 
 
@@ -150,6 +277,7 @@ def process_completed_job(job_id, year_month):
     """
     Move completed job data to final destination.
     Verifies successful copying before deleting source files.
+    Also cleans up input files for completed jobs.
     """
     source_dir = os.path.join(SERVER_COMPLETE_DIR, job_id)
     dest_dir = os.path.join(DESTINATION_DIR, year_month)
@@ -193,7 +321,7 @@ def process_completed_job(job_id, year_month):
     if copied_count == len(source_files):
         logger.info(f"All {copied_count} files were successfully copied to destination")
 
-        # Delete original files
+        # Delete original files from complete directory
         deleted_count = 0
         for file_path in successful_copies:
             try:
@@ -203,6 +331,64 @@ def process_completed_job(job_id, year_month):
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
         logger.info(f"Deleted {deleted_count} original files after successful copying")
+
+        # Clean up input files for this job
+        try:
+            # Get the manifest file path
+            manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
+
+            # Check if manifest still exists (it might have been already removed by consumer)
+            if os.path.exists(manifest_path):
+                # Load the manifest to get list of files
+                with open(manifest_path, 'r') as f:
+                    manifest_data = json.load(f)
+
+                # Get the list of files to clean up
+                metric_files = manifest_data.get("metric_files", [])
+                accounting_files = manifest_data.get("accounting_files", [])
+                all_files = metric_files + accounting_files
+
+                # Delete each input file
+                input_deleted_count = 0
+                for file_name in all_files:
+                    file_path = os.path.join(SERVER_INPUT_DIR, file_name)
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        input_deleted_count += 1
+
+                # Delete the manifest file itself
+                if os.path.exists(manifest_path):
+                    os.remove(manifest_path)
+                    input_deleted_count += 1
+
+                logger.info(f"Cleaned up {input_deleted_count} input files for completed job {job_id}")
+            else:
+                logger.info(f"Manifest for job {job_id} already removed, skipping input cleanup")
+
+        except Exception as e:
+            logger.error(f"Error cleaning up input files for job {job_id}: {str(e)}")
+
+        # Try to remove the job directory if it's empty
+        try:
+            # Check if directory is empty after file removal
+            remaining_files = os.listdir(source_dir)
+            if not remaining_files:
+                shutil.rmtree(source_dir)
+                logger.info(f"Removed empty job directory {source_dir}")
+            else:
+                logger.warning(f"Job directory {source_dir} still contains {len(remaining_files)} files, not removing")
+        except Exception as e:
+            logger.error(f"Error removing job directory {source_dir}: {str(e)}")
+
+        # Remove the status file
+        try:
+            status_file = os.path.join(SERVER_COMPLETE_DIR, f"{job_id}.status")
+            if os.path.exists(status_file):
+                os.remove(status_file)
+                logger.info(f"Removed status file for job {job_id}")
+        except Exception as e:
+            logger.error(f"Error removing status file for job {job_id}: {str(e)}")
+
         return True
     else:
         logger.warning(

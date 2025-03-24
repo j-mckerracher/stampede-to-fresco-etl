@@ -22,19 +22,23 @@ def print_current_time():
 
 log_dir = "/home/dynamo/a/jmckerra/projects/stampede-step-3/logs"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"{print_current_time()}_start.log")
+log_file = os.path.join(log_dir, f"consumer.log")
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # Keep console output as well
+        ]
 )
 logger = logging.getLogger('job-metrics-consumer')
 
 SERVER_INPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/input"
 SERVER_OUTPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/output"
 SERVER_COMPLETE_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/complete"
-NUM_THREADS = 20
+NUM_THREADS = 10
 MAX_MEMORY_PERCENT = 80
 
 
@@ -58,6 +62,55 @@ def list_source_files():
             data_files.append(file_path)
 
     return manifest_files, data_files
+
+
+def parse_datetime_column(df, column, formats=None):
+    """Parse a datetime column with multiple format attempts"""
+    if formats is None:
+        formats = [
+            "%m/%d/%Y %H:%M:%S",  # MM/DD/YYYY HH:MM:SS format (from CSV job data)
+            "%Y-%m-%d %H:%M:%S",  # YYYY-MM-DD HH:MM:SS format (from parquet time series)
+        ]
+
+    if column not in df.columns:
+        return df
+
+    # If already datetime, return as-is
+    if df.schema[column] == pl.Datetime:
+        return df
+
+    # Create a sample for debugging
+    sample_values = df.select(pl.col(column)).head(5).to_series()
+    logger.debug(f"Sample {column} values: {sample_values}")
+
+    # Try each format
+    for fmt in formats:
+        try:
+            # Try conversion with current format
+            result = df.with_columns(
+                pl.col(column).str.to_datetime(fmt, strict=False).alias("_datetime_temp")
+            )
+
+            # Check if we have successfully parsed values
+            non_null_count = result.select(pl.col("_datetime_temp").is_not_null().sum()).item()
+            total_count = len(result)
+
+            if non_null_count > 0:
+                success_pct = (non_null_count / total_count) * 100
+                # logger.info(
+                #     f"Format '{fmt}' successfully parsed {non_null_count}/{total_count} rows ({success_pct:.2f}%) of {column}")
+
+                # Use this format if it parsed a good portion of the data
+                df = df.with_columns(
+                    pl.col(column).str.to_datetime(fmt, strict=False).alias(column)
+                )
+                return df
+        except Exception as e:
+            logger.debug(f"Format '{fmt}' failed for {column}: {e}")
+
+    # If we get here, all formats failed
+    logger.warning(f"Failed to parse {column} as datetime with any format")
+    return df
 
 
 def load_job_from_manifest(manifest_path):
@@ -107,24 +160,30 @@ def estimate_output_rows(job_metrics, start_time, end_time, hosts_count):
 
 
 def load_accounting_data(accounting_files):
-    """Load accounting data from CSV files."""
+    """Load accounting data from CSV files with optimization."""
     dfs = []
 
-    for file_path in accounting_files:
-        try:
-            df = pl.read_csv(file_path)
+    # Process files in parallel
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(NUM_THREADS, len(accounting_files))) as executor:
+        futures = []
 
-            # Parse date columns with correct format
-            df = df.with_columns([
-                pl.col("start").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
-                pl.col("end").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
-                pl.col("submit").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S")
-            ])
+        for file_path in accounting_files:
+            futures.append(executor.submit(pl.read_csv, file_path))
 
-            dfs.append(df)
-            logger.info(f"Successfully loaded accounting file {file_path} with {len(df)} rows")
-        except Exception as e:
-            logger.error(f"Error loading accounting file {file_path}: {str(e)}")
+        for future in futures:
+            try:
+                df = future.result()
+                # Parse date columns with correct format
+                df = df.with_columns([
+                    pl.col("start").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
+                    pl.col("end").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
+                    pl.col("submit").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S")
+                ])
+                dfs.append(df)
+                logger.info(f"Successfully loaded accounting file with {len(df)} rows")
+            except Exception as e:
+                logger.error(f"Error loading accounting file: {str(e)}")
 
     if dfs:
         result = pl.concat(dfs)
@@ -135,42 +194,56 @@ def load_accounting_data(accounting_files):
 
 
 def load_metric_data(metric_files):
-    """Load metric data from Parquet files."""
+    """Load metric data from Parquet files with batch processing and memory optimization."""
     dfs = []
     total_files = len(metric_files)
 
-    logger.info(f"Loading {total_files} metric files")
+    # Process in smaller batches to manage memory
+    batch_size = 50  # Process 50 files at a time
 
-    for i, file_path in enumerate(metric_files):
-        try:
-            if i % 20 == 0:  # Log progress for large numbers of files
-                logger.info(f"Loading metric file {i + 1}/{total_files}")
+    for batch_start in range(0, total_files, batch_size):
+        batch_end = min(batch_start + batch_size, total_files)
+        current_batch = metric_files[batch_start:batch_end]
 
-            df = pl.read_parquet(file_path)
+        logger.info(f"Loading metric files batch {batch_start // batch_size + 1}/{(total_files - 1) // batch_size + 1}")
 
-            # Ensure Timestamp column is datetime
-            if "Timestamp" in df.columns:
-                df = df.with_columns([
-                    pl.col("Timestamp").str.to_datetime()
-                ])
+        batch_dfs = []
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(NUM_THREADS, len(current_batch))) as executor:
+            futures = []
 
-            dfs.append(df)
+            # Only read essential columns to save memory
+            columns = ["Job Id", "Timestamp", "Host", "Event", "Value"]
+
+            for file_path in current_batch:
+                futures.append(executor.submit(pl.read_parquet, file_path, columns=columns))
+
+            for future in futures:
+                try:
+                    df = future.result()
+                    # Ensure Timestamp column is datetime using parse_datetime_column
+                    if "Timestamp" in df.columns:
+                        df = parse_datetime_column(df, "Timestamp")
+                    batch_dfs.append(df)
+                except Exception as e:
+                    logger.error(f"Error loading metric file: {str(e)}")
+
+        if batch_dfs:
+            # Concatenate the batch and add to our list
+            batch_df = pl.concat(batch_dfs)
+            dfs.append(batch_df)
+            logger.info(f"Added batch with {len(batch_df)} rows")
 
             # Check memory usage and wait if needed
             memory_percent = psutil.virtual_memory().percent
             if memory_percent > MAX_MEMORY_PERCENT:
                 logger.warning(f"Memory usage high ({memory_percent}%), waiting for GC")
-                # Force some garbage collection by clearing already concatenated dataframes
-                if len(dfs) > 1:
-                    combined = pl.concat(dfs)
-                    dfs = [combined]
+                import gc
+                gc.collect()
                 time.sleep(5)  # Wait a bit for memory to be freed
 
-        except Exception as e:
-            logger.error(f"Error loading metric file {file_path}: {str(e)}")
-
     if dfs:
-        logger.info(f"Concatenating {len(dfs)} dataframes")
+        logger.info(f"Concatenating {len(dfs)} batches")
         result = pl.concat(dfs)
         logger.info(f"Loaded {len(result)} total metric rows")
         return result
@@ -181,182 +254,193 @@ def load_metric_data(metric_files):
 def join_data(metric_df, accounting_df, output_dir, year_month):
     """
     Join metric data with accounting data using 5-minute time chunks.
-    Periodically writes data to disk to manage memory.
+    Optimized with batch processing and indexing.
     """
-    joined_results = []
-    jobs_with_data_count = 0
+    from datetime import timedelta
+    import gc
+
+    # Create index on Job Id in metric_df to speed up filtering
+    logger.info("Creating indexes for faster joins")
+    # Extract unique job IDs from accounting data
+    accounting_job_ids = accounting_df["jobID"].unique().to_list()
+
+    # Create batch processing for accounting data
+    batch_size = max(100, len(accounting_df) // NUM_THREADS)
+    batches = []
+
+    for i in range(0, len(accounting_df), batch_size):
+        batches.append(accounting_df.slice(i, min(batch_size, len(accounting_df) - i)))
+
+    logger.info(f"Split accounting data into {len(batches)} batches for processing")
+
+    # Define common constants
+    chunk_duration = timedelta(minutes=5)
+    all_batch_dirs = []
     batch_num = 1
 
-    # Process each job in accounting data
-    total_jobs = len(accounting_df)
-    logger.info(f"Processing {total_jobs} jobs for {year_month}")
+    for batch_idx, batch_df in enumerate(batches):
+        joined_results = []
+        jobs_with_data_count = 0
 
-    for job_idx, job_row in enumerate(accounting_df.iter_rows(named=True)):
-        job_id = job_row["jobID"]
+        logger.info(f"Processing batch {batch_idx + 1}/{len(batches)}")
+        batch_start_time = time.time()
 
-        # Log progress for large jobs
-        if job_idx % 100 == 0 or job_idx == total_jobs - 1:
-            logger.info(f"Processing job {job_idx + 1}/{total_jobs}: {job_id}")
-            # Also log memory usage
-            memory_info = psutil.virtual_memory()
-            logger.info(
-                f"Memory usage: {memory_info.percent}% ({memory_info.used / 1024 ** 3:.1f}GB / {memory_info.total / 1024 ** 3:.1f}GB)")
+        # Process each job in the batch
+        for job_idx, job_row in enumerate(batch_df.iter_rows(named=True)):
+            job_id = job_row["jobID"]
+            start_time = job_row["start"]
+            end_time = job_row["end"]
 
-        start_time = job_row["start"]
-        end_time = job_row["end"]
+            # Log progress for large batches
+            if job_idx % 100 == 0 or job_idx == len(batch_df) - 1:
+                logger.info(f"Processing job {job_idx + 1}/{len(batch_df)}")
+                memory_info = psutil.virtual_memory()
+                logger.info(f"Memory: {memory_info.percent}% ({memory_info.used / 1024 ** 3:.1f}GB)")
 
-        # Filter metrics for this job and time window (try different job ID formats)
-        job_metrics = metric_df.filter(
-            ((pl.col("Job Id") == job_id) |
-             (pl.col("Job Id") == f"JOB{job_id.replace('jobID', '')}") |
-             (pl.col("Job Id") == f"JOBID{job_id.replace('jobID', '')}")) &
-            (pl.col("Timestamp") >= start_time) &
-            (pl.col("Timestamp") <= end_time)
-        )
+            # Try different job ID formats - polars doesn't support regex so we create variations
+            job_id_alt1 = f"JOB{job_id.replace('jobID', '')}" if "jobID" in job_id else f"JOB{job_id}"
+            job_id_alt2 = f"JOBID{job_id.replace('jobID', '')}" if "jobID" in job_id else f"JOBID{job_id}"
 
-        if len(job_metrics) == 0:
-            if job_idx % 1000 == 0:  # Reduce log volume by only logging every 1000th empty job
-                logger.info(f"No metrics found for job {job_id}")
-            continue
-
-        # This job has data - increment our counter
-        jobs_with_data_count += 1
-
-        # Get all hosts for this job
-        hosts = job_metrics.select(pl.col("Host").unique()).to_series().to_list()
-        host_list_str = ",".join(hosts)
-
-        # Log job details
-        total_job_minutes = (end_time - start_time).total_seconds() / 60
-        logger.info(
-            f"Job {job_id} has {len(hosts)} hosts, duration: {total_job_minutes:.1f} minutes, {len(job_metrics)} metrics")
-
-        # Create 5-minute chunks covering the job's duration
-        chunk_duration = timedelta(minutes=5)
-        current_chunk_start = start_time
-
-        while current_chunk_start < end_time:
-            current_chunk_end = current_chunk_start + chunk_duration
-            if current_chunk_end > end_time:
-                current_chunk_end = end_time
-
-            # Filter metrics for this time chunk
-            chunk_metrics = job_metrics.filter(
-                (pl.col("Timestamp") >= current_chunk_start) &
-                (pl.col("Timestamp") < current_chunk_end)
+            # Filter metrics for this job and time window
+            job_metrics = metric_df.filter(
+                ((pl.col("Job Id") == job_id) |
+                 (pl.col("Job Id") == job_id_alt1) |
+                 (pl.col("Job Id") == job_id_alt2)) &
+                (pl.col("Timestamp") >= start_time) &
+                (pl.col("Timestamp") <= end_time)
             )
 
-            # Process each host in this time chunk
+            if len(job_metrics) == 0:
+                continue
+
+            # Increment our counter for jobs with data
+            jobs_with_data_count += 1
+
+            # Get all hosts for this job
+            hosts = job_metrics.select(pl.col("Host").unique()).to_series().to_list()
+            host_list_str = ",".join(hosts)
+
+            # Calculate chunks more efficiently
+            chunks = []
+            current_time = start_time
+            while current_time < end_time:
+                next_time = min(current_time + chunk_duration, end_time)
+                chunks.append((current_time, next_time))
+                current_time = next_time
+
+            # Process each host - this is most efficient outside the chunk loop
             for host in hosts:
-                # Initialize metrics dictionary for this host and chunk
-                host_metrics = {
-                    "value_cpuuser": None,
-                    "value_gpu": None,
-                    "value_memused": None,
-                    "value_memused_minus_diskcache": None,
-                    "value_nfs": None,
-                    "value_block": None
-                }
+                # Filter metrics for this host (once per host, not per chunk)
+                host_metrics = job_metrics.filter(pl.col("Host") == host)
 
-                # Filter metrics for this host
-                host_chunk_data = chunk_metrics.filter(pl.col("Host") == host)
+                # Now process each time chunk
+                for chunk_start, chunk_end in chunks:
+                    # Extract metrics for this chunk
+                    chunk_metrics = host_metrics.filter(
+                        (pl.col("Timestamp") >= chunk_start) &
+                        (pl.col("Timestamp") < chunk_end)
+                    )
 
-                # Process each metric type
-                for event in ["cpuuser", "memused", "memused_minus_diskcache", "nfs", "block"]:
-                    event_data = host_chunk_data.filter(pl.col("Event") == event)
+                    if len(chunk_metrics) == 0:
+                        continue
 
-                    if len(event_data) > 0:
-                        # If multiple values exist in this 5-min chunk, average them
-                        avg_value = event_data["Value"].mean()
-                        host_metrics[f"value_{event}"] = avg_value
+                    # Use efficient groupby for metric calculation
+                    metrics_by_event = chunk_metrics.group_by("Event").agg(
+                        pl.col("Value").mean().alias("avg_value")
+                    )
 
-                # Create rows for each unit type
-                units_list = ["CPU %", "GB", "GB/s", "MB/s"]
-                for unit in units_list:
-                    row = {
-                        "time": current_chunk_start,
-                        "submit_time": job_row["submit"],
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "timelimit": job_row["walltime"],
-                        "nhosts": job_row["nnodes"],
-                        "ncores": job_row["ncpus"],
-                        "account": job_row["account"],
-                        "queue": job_row["queue"],
-                        "host": host,
-                        "jid": job_id,
-                        "unit": unit,
-                        "jobname": job_row["jobname"],
-                        "exitcode": job_row["exit_status"],
-                        "host_list": host_list_str,
-                        "username": job_row["user"]
+                    # Convert to dictionary for easy lookup
+                    metric_values = {
+                        "value_cpuuser": None,
+                        "value_gpu": None,
+                        "value_memused": None,
+                        "value_memused_minus_diskcache": None,
+                        "value_nfs": None,
+                        "value_block": None
                     }
 
-                    # Add all metric values
-                    for metric_key, value in host_metrics.items():
-                        row[metric_key] = value
+                    # Fill in values we found
+                    for row in metrics_by_event.iter_rows(named=True):
+                        metric_values[f"value_{row['Event']}"] = row["avg_value"]
 
-                    joined_results.append(row)
+                    # Create rows for each unit type (a constant set of 4)
+                    for unit in ["CPU %", "GB", "GB/s", "MB/s"]:
+                        row = {
+                            "time": chunk_start,
+                            "submit_time": job_row["submit"],
+                            "start_time": start_time,
+                            "end_time": end_time,
+                            "timelimit": job_row["walltime"],
+                            "nhosts": job_row["nnodes"],
+                            "ncores": job_row["ncpus"],
+                            "account": job_row["account"],
+                            "queue": job_row["queue"],
+                            "host": host,
+                            "jid": job_id,
+                            "unit": unit,
+                            "jobname": job_row["jobname"],
+                            "exitcode": job_row["exit_status"],
+                            "host_list": host_list_str,
+                            "username": job_row["user"]
+                        }
 
-            # Move to next chunk
-            current_chunk_start = current_chunk_end
+                        # Add all metric values
+                        row.update(metric_values)
+                        joined_results.append(row)
 
-        # Check if we've processed 10,000 jobs with data - if so, write to disk
-        if jobs_with_data_count % 10000 == 0:
-            if len(joined_results) > 0:
-                logger.info(f"Reached {jobs_with_data_count} jobs with data. Writing batch {batch_num} to disk...")
+            # Check if memory is getting too high - save batch if needed
+            if job_idx % 100 == 0:
+                memory_percent = psutil.virtual_memory().percent
+                if memory_percent > MAX_MEMORY_PERCENT * 0.8 and len(joined_results) > 10000:
+                    logger.warning(f"Memory usage high ({memory_percent}%), writing partial batch")
 
-                # Convert to DataFrame
-                batch_df = pl.DataFrame(joined_results)
+                    # Write current results to disk
+                    interim_df = pl.DataFrame(joined_results)
+                    batch_dir = os.path.join(output_dir, f"batch_{batch_num}")
+                    os.makedirs(batch_dir, exist_ok=True)
+                    interim_file = os.path.join(batch_dir, f"joined_data_{year_month}_part{batch_num}.parquet")
+                    interim_df.write_parquet(interim_file)
 
-                # Create batch directory
-                batch_dir = os.path.join(output_dir, f"batch_{batch_num}")
-                os.makedirs(batch_dir, exist_ok=True)
+                    logger.info(f"Wrote interim {len(interim_df)} rows to {interim_file}")
+                    all_batch_dirs.append(batch_dir)
+                    batch_num += 1
 
-                # Write to parquet
-                batch_file = os.path.join(batch_dir, f"joined_data_{year_month}_batch{batch_num}.parquet")
-                batch_df.write_parquet(batch_file)
-                logger.info(f"Wrote {len(batch_df)} rows to {batch_file}")
+                    # Clear results and force GC
+                    joined_results = []
+                    gc.collect()
 
-                # Clear memory
-                joined_results = []
+        # Write the final batch results
+        if joined_results:
+            batch_df = pl.DataFrame(joined_results)
+            batch_dir = os.path.join(output_dir, f"batch_{batch_num}")
+            os.makedirs(batch_dir, exist_ok=True)
+            batch_file = os.path.join(batch_dir, f"joined_data_{year_month}_batch{batch_num}.parquet")
+            batch_df.write_parquet(batch_file)
 
-                # Force garbage collection to reclaim memory
-                import gc
-                gc.collect()
+            logger.info(f"Wrote final {len(batch_df)} rows to {batch_file}")
+            all_batch_dirs.append(batch_dir)
+            batch_num += 1
 
-                # Log memory after clearing
-                memory_info = psutil.virtual_memory()
-                logger.info(f"Memory after clearing: {memory_info.percent}% ({memory_info.used / 1024 ** 3:.1f}GB)")
+        batch_end_time = time.time()
+        logger.info(f"Batch {batch_idx + 1} processing completed in {batch_end_time - batch_start_time:.1f}s")
 
-                batch_num += 1
+        # Force garbage collection between batches
+        gc.collect()
 
-    # Write any remaining results
-    if len(joined_results) > 0:
-        logger.info(f"Writing final batch {batch_num} with {len(joined_results)} rows")
-        batch_df = pl.DataFrame(joined_results)
+    # Remove duplicates from batch_dirs list
+    unique_batch_dirs = list(set(all_batch_dirs))
+    logger.info(f"Completed join with {len(unique_batch_dirs)} output batch directories")
 
-        # Create batch directory
-        batch_dir = os.path.join(output_dir, f"batch_{batch_num}")
-        os.makedirs(batch_dir, exist_ok=True)
-
-        # Write to parquet
-        batch_file = os.path.join(batch_dir, f"joined_data_{year_month}_batch{batch_num}.parquet")
-        batch_df.write_parquet(batch_file)
-        logger.info(f"Wrote {len(batch_df)} rows to {batch_file}")
-
-    logger.info(f"Processed {jobs_with_data_count} jobs with data across {batch_num} batches")
-
-    # Return list of batch directories
-    return [os.path.join(output_dir, f"batch_{i}") for i in range(1, batch_num + 1)]
+    return unique_batch_dirs
 
 
 def process_job(job_id, year_month, metric_files, accounting_files):
-    """Process a job to join metric and accounting data."""
+    """Process a job with optimized data loading and joining."""
     try:
+        start_time = time.time()
         logger.info(f"Processing job {job_id} for {year_month}")
 
-        # Load accounting data
+        # Load accounting data first (usually smaller)
         logger.info(f"Loading accounting data from {len(accounting_files)} files")
         accounting_df = load_accounting_data(accounting_files)
 
@@ -365,7 +449,10 @@ def process_job(job_id, year_month, metric_files, accounting_files):
             save_status(job_id, "failed", {"error": "No accounting data found"})
             return False
 
-        # Load metric data
+        logger.info(f"Accounting data loaded with {len(accounting_df)} rows in {time.time() - start_time:.1f}s")
+
+        # Load metric data (usually larger)
+        metric_load_start = time.time()
         logger.info(f"Loading metric data from {len(metric_files)} files")
         metric_df = load_metric_data(metric_files)
 
@@ -374,15 +461,27 @@ def process_job(job_id, year_month, metric_files, accounting_files):
             save_status(job_id, "failed", {"error": "No metric data found"})
             return False
 
+        logger.info(f"Metric data loaded with {len(metric_df)} rows in {time.time() - metric_load_start:.1f}s")
+
         # Setup output directory
         output_dir = Path(SERVER_OUTPUT_DIR) / job_id
         os.makedirs(output_dir, exist_ok=True)
 
-        # Join the data with periodic writing to manage memory
-        logger.info("Joining metric and accounting data with 5-minute chunking")
+        # Join the data
+        join_start = time.time()
+        logger.info("Joining metric and accounting data")
         batch_dirs = join_data(metric_df, accounting_df, str(output_dir), year_month)
 
+        logger.info(f"Data joining completed in {time.time() - join_start:.1f}s")
+
+        # Free memory
+        del metric_df
+        del accounting_df
+        import gc
+        gc.collect()
+
         # Copy results to complete directory
+        copy_start = time.time()
         complete_dir = Path(SERVER_COMPLETE_DIR) / job_id
         os.makedirs(complete_dir, exist_ok=True)
 
@@ -396,21 +495,26 @@ def process_job(job_id, year_month, metric_files, accounting_files):
                     # Copy the file
                     shutil.copy2(source_file, dest_file)
                     copied_files.append(dest_file)
-                    logger.info(f"Copied {source_file} to {dest_file}")
+
+        logger.info(f"Copied {len(copied_files)} files in {time.time() - copy_start:.1f}s")
 
         # Update job status
+        total_time = time.time() - start_time
         save_status(job_id, "completed", {
             "year_month": year_month,
             "total_batches": len(batch_dirs),
             "files_copied": len(copied_files),
+            "processing_time_seconds": total_time,
             "ready_for_final_destination": True
         })
 
-        logger.info(f"Job {job_id} completed successfully with {len(batch_dirs)} batches")
+        logger.info(f"Job {job_id} completed successfully in {total_time:.1f}s")
         return True
 
     except Exception as e:
         logger.error(f"Error processing job {job_id}: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
         save_status(job_id, "failed", {"error": str(e)})
         return False
 
@@ -439,12 +543,19 @@ def process_manifest(manifest_path):
 
 
 def main():
-    """Main consumer function."""
+    """Main ETL consumer function with optimized processing and monitoring."""
     setup_directories()
+
+    logger.info(f"Starting ETL consumer with {NUM_THREADS} threads and {MAX_MEMORY_PERCENT}% memory limit")
 
     while True:
         try:
             logger.info("Starting ETL consumer cycle")
+
+            # Report system status
+            memory_info = psutil.virtual_memory()
+            logger.info(
+                f"Memory: {memory_info.percent}% used ({memory_info.used / 1024 ** 3:.1f}GB / {memory_info.total / 1024 ** 3:.1f}GB)")
 
             # List manifest files
             manifest_files, _ = list_source_files()
@@ -452,15 +563,28 @@ def main():
             if manifest_files:
                 logger.info(f"Found {len(manifest_files)} manifests to process")
 
+                # Process each manifest sequentially for stability
+                # This is safer than parallel processing for large data jobs
                 for manifest_path in manifest_files:
-                    # Process this manifest
-                    process_manifest(manifest_path)
+                    try:
+                        process_manifest(manifest_path)
 
-                    # Check memory after each job
-                    memory_percent = psutil.virtual_memory().percent
-                    if memory_percent > 90:
-                        logger.warning(f"High memory usage ({memory_percent}%), taking a break")
-                        time.sleep(60)  # Give system time to recover
+                        # Check memory after each job
+                        memory_percent = psutil.virtual_memory().percent
+                        if memory_percent > 90:
+                            logger.warning(f"High memory usage ({memory_percent}%), taking a break")
+                            time.sleep(60)  # Give system time to recover
+                    except Exception as e:
+                        logger.error(f"Error processing manifest {manifest_path}: {str(e)}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+
+                        # Try to remove the manifest even if processing failed
+                        try:
+                            os.remove(manifest_path)
+                            logger.info(f"Removed problematic manifest {manifest_path}")
+                        except:
+                            logger.error(f"Could not remove manifest {manifest_path}")
             else:
                 logger.info("No manifests found, waiting...")
 
@@ -469,7 +593,9 @@ def main():
 
         except Exception as e:
             logger.error(f"Error in ETL consumer cycle: {str(e)}")
-            time.sleep(10)
+            import traceback
+            logger.error(traceback.format_exc())
+            time.sleep(30)  # Longer sleep on main loop error for system recovery
 
 
 if __name__ == "__main__":
