@@ -1,235 +1,206 @@
+#!/usr/bin/env python3
 import os
 import json
 import time
 import uuid
 import shutil
 import logging
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger('job-metrics-producer')
+from datetime import datetime
+from pathlib import Path
+import traceback
+import glob
 
 # Configuration (modify these paths as needed)
-SOURCE_METRICS_DIR = r"P:\Stampede\stampede-ts-fresco-form-daily-2"
-SOURCE_ACCOUNTING_DIR = r"P:\Stampede\stampede-accounting"
-SERVER_INPUT_DIR = r"U:\projects\stampede-step-3\input"
-SERVER_COMPLETE_DIR = r"U:\projects\stampede-step-3\complete"
-DESTINATION_DIR = r"P:\Stampede\stampede-converted-3"
+SOURCE_DIR = Path(r"P:\Stampede\stampede-ts-fresco-form-daily-2")
+DESTINATION_DIR = Path(r"P:\Stampede\sorted-daily-metrics")
+SERVER_INPUT_DIR = Path(r"U:\projects\stampede-step-3\input")
+SERVER_OUTPUT_DIR = Path(r"U:\projects\stampede-step-3\output")
+SERVER_COMPLETE_DIR = Path(r"U:\projects\stampede-step-3\complete")
+LOGS_DIR = Path("logs")
+
+# Maximum number of active jobs at once
+MAX_ACTIVE_JOBS = 3
 
 # Active jobs tracking
-MAX_ACTIVE_JOBS = 2
 active_jobs = {}
+
+
+def setup_logging():
+    """Configure logging to file and console."""
+    LOGS_DIR.mkdir(exist_ok=True)
+
+    log_file = LOGS_DIR / f"metrics_processor_producer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()  # Keep console output as well
+        ]
+    )
+
+    return logging.getLogger("metrics_processor_producer")
 
 
 def setup_directories():
     """Create necessary directories if they don't exist."""
-    for directory in [SERVER_INPUT_DIR, SERVER_COMPLETE_DIR, DESTINATION_DIR]:
+    for directory in [SERVER_INPUT_DIR, SERVER_OUTPUT_DIR, SERVER_COMPLETE_DIR, LOGS_DIR]:
         os.makedirs(directory, exist_ok=True)
-        logger.info(f"Ensured directory exists: {directory}")
+        logging.info(f"Ensured directory exists: {directory}")
+
+    # Create destination directory if it doesn't exist
+    DESTINATION_DIR.mkdir(exist_ok=True, parents=True)
+    logging.info(f"Ensured destination directory exists: {DESTINATION_DIR}")
 
 
-def find_source_files():
-    """Find metric and accounting files that need processing."""
-    # Find metric files
-    metric_files = []
-    for root, _, files in os.walk(SOURCE_METRICS_DIR):
-        for file in files:
-            if file.startswith("perf_metrics_") and file.endswith(".parquet"):
-                metric_files.append(os.path.join(root, file))
-
-    # Find accounting files
-    accounting_files = []
-    for root, _, files in os.walk(SOURCE_ACCOUNTING_DIR):
-        for file in files:
-            if file.endswith(".csv"):
-                accounting_files.append(os.path.join(root, file))
-
-    logger.info(f"Found {len(metric_files)} metric files and {len(accounting_files)} accounting files")
-    return metric_files, accounting_files
-
-
-def organize_by_month(metric_files):
-    """Group metric files by year-month following ETL workflow."""
-    files_by_month = {}
-
-    for file_path in metric_files:
-        filename = os.path.basename(file_path)
-        # Extract date from filename (perf_metrics_YYYY-MM-DD.parquet)
-        date_str = filename.replace("perf_metrics_", "").replace(".parquet", "")
-        year_month = date_str[:7]  # YYYY-MM
-
-        if year_month not in files_by_month:
-            files_by_month[year_month] = []
-        files_by_month[year_month].append(file_path)
-
-    logger.info(f"Organized files into {len(files_by_month)} months")
-    return files_by_month
+def find_source_folders():
+    """Find folders in the source directory that need processing."""
+    try:
+        # List all subfolders in the source directory
+        folders = [f for f in SOURCE_DIR.iterdir() if f.is_dir()]
+        return folders
+    except Exception as e:
+        logging.error(f"Error finding source folders: {str(e)}")
+        return []
 
 
 def check_existing_manifests():
     """Check for existing manifest files in the input directory."""
-    existing_months = set()
+    existing_folders = set()
 
     for file in os.listdir(SERVER_INPUT_DIR):
         if file.endswith(".manifest.json"):
             try:
-                manifest_path = os.path.join(SERVER_INPUT_DIR, file)
+                manifest_path = SERVER_INPUT_DIR / file
                 with open(manifest_path, 'r') as f:
                     manifest_data = json.load(f)
                     year_month = manifest_data.get("year_month")
                     if year_month:
-                        existing_months.add(year_month)
-                        logger.info(f"Found existing manifest for {year_month}")
+                        existing_folders.add(year_month)
+                        logging.info(f"Found existing manifest for folder {year_month}")
             except Exception as e:
-                logger.error(f"Error reading manifest file {file}: {str(e)}")
+                logging.error(f"Error reading manifest file {file}: {str(e)}")
 
-    return existing_months
+    return existing_folders
 
 
 def check_active_consumer_jobs():
     """Check status files in the complete directory to determine jobs the consumer is processing."""
     active_consumer_jobs = []
+    active_folder_names = set()
 
     # Look for all status files in the complete directory
     for file in os.listdir(SERVER_COMPLETE_DIR):
         if file.endswith(".status"):
-            status_file_path = os.path.join(SERVER_COMPLETE_DIR, file)
-
             try:
+                status_file_path = SERVER_COMPLETE_DIR / file
+
                 with open(status_file_path, 'r') as f:
                     status_data = json.load(f)
 
                 job_id = status_data.get("job_id")
                 status = status_data.get("status")
+                year_month = status_data.get("year_month")
 
                 # Check if the job is still being processed (not completed or failed)
-                if status == "processing":
+                if status == "processing" and year_month:
                     active_consumer_jobs.append(job_id)
-                    logger.info(f"Consumer is actively processing job {job_id}")
+                    active_folder_names.add(year_month)
+                    logging.info(f"Consumer is actively processing folder {year_month} (job {job_id})")
             except Exception as e:
-                logger.error(f"Error reading status file {status_file_path}: {str(e)}")
+                logging.error(f"Error reading status file {file}: {str(e)}")
 
-    logger.info(f"Found {len(active_consumer_jobs)} active consumer jobs")
-    return active_consumer_jobs
+    return active_consumer_jobs, active_folder_names
 
 
-def cleanup_input_files(job_id):
-    """Clean up original input files for a completed job."""
+def check_completed_folders():
+    """Check for folders that have already been processed and moved to destination."""
+    completed_folders = set()
+
     try:
-        # Get the manifest file path
-        manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
+        # List all subdirectories in the destination directory
+        for folder in DESTINATION_DIR.iterdir():
+            if folder.is_dir():
+                completed_folders.add(folder.name)
+    except Exception as e:
+        logging.error(f"Error checking completed folders: {str(e)}")
 
-        # Check if manifest still exists (it might have been already removed by consumer)
-        if not os.path.exists(manifest_path):
-            logger.info(f"Manifest for job {job_id} already removed, skipping input cleanup")
-            return
+    return completed_folders
 
-        # Load the manifest to get list of files
-        with open(manifest_path, 'r') as f:
-            manifest_data = json.load(f)
 
-        # Get the list of files to clean up
-        metric_files = manifest_data.get("metric_files", [])
-        accounting_files = manifest_data.get("accounting_files", [])
-        all_files = metric_files + accounting_files
+def copy_folder_to_input(source_folder, logger):
+    """Copy sorted metric files from source to input directory."""
+    folder_name = source_folder.name
+    input_folder = SERVER_INPUT_DIR / folder_name
 
-        # Delete each input file
-        deleted_count = 0
-        for file_name in all_files:
-            file_path = os.path.join(SERVER_INPUT_DIR, file_name)
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                deleted_count += 1
+    try:
+        # Create the destination directory
+        input_folder.mkdir(exist_ok=True)
 
-        # Delete the manifest file itself
-        if os.path.exists(manifest_path):
-            os.remove(manifest_path)
-            deleted_count += 1
+        # Find all sorted performance metric files in the source folder
+        sorted_files = list(source_folder.glob("sorted_perf_metrics_*.parquet"))
 
-        logger.info(f"Cleaned up {deleted_count} input files for completed job {job_id}")
+        if not sorted_files:
+            # Check for unsorted files if no sorted files found
+            unsorted_files = list(source_folder.glob("perf_metrics_*.parquet"))
+            if not unsorted_files:
+                logger.warning(f"No metric files found in {source_folder}")
+                return False
+
+            logger.info(f"Found {len(unsorted_files)} unsorted files in {source_folder}")
+
+            # Copy unsorted files
+            for file in unsorted_files:
+                dest_file = input_folder / file.name
+                shutil.copy2(file, dest_file)
+
+            logger.info(f"Copied {len(unsorted_files)} unsorted files to {input_folder}")
+        else:
+            logger.info(f"Found {len(sorted_files)} sorted files in {source_folder}")
+
+            # Copy sorted files
+            for file in sorted_files:
+                dest_file = input_folder / file.name
+                shutil.copy2(file, dest_file)
+
+            logger.info(f"Copied {len(sorted_files)} sorted files to {input_folder}")
+
+        return True
 
     except Exception as e:
-        logger.error(f"Error cleaning up input files for job {job_id}: {str(e)}")
+        logger.error(f"Error copying folder {folder_name} to input: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
 
 
-def distribute_jobs(files_by_month, accounting_files):
-    """Create job manifests and distribute work to server."""
-    jobs_created = 0
+def create_job_manifest(year_month, sorted_files, logger):
+    """Create a job manifest file for a folder."""
+    try:
+        # Generate a unique job ID
+        job_id = f"process_{year_month}_{uuid.uuid4().hex[:8]}"
 
-    # Check how many jobs the consumer is currently processing
-    active_consumer_jobs = check_active_consumer_jobs()
+        # Get list of sorted file names
+        sorted_file_names = [os.path.basename(f) for f in sorted_files]
 
-    # Get months that are currently being processed
-    months_in_process = set()
-    for job_id in active_consumer_jobs:
-        # Try to extract month from job ID
-        if job_id.startswith("job_") and len(job_id.split("_")) >= 3:
-            month = job_id.split("_")[1]
-            months_in_process.add(month)
-
-    # Check for existing manifests in the input directory
-    existing_manifests = check_existing_manifests()
-
-    # Combine all months that should be skipped
-    months_to_skip = months_in_process.union(existing_manifests)
-
-    logger.info(f"Months to skip (in process or existing manifests): {months_to_skip}")
-
-    # If the consumer is already at capacity, don't create more jobs
-    total_active_jobs = len(active_consumer_jobs) + len(existing_manifests)
-    if total_active_jobs >= MAX_ACTIVE_JOBS:
-        logger.info(
-            f"Already at maximum capacity with {len(active_consumer_jobs)} active jobs and {len(existing_manifests)} pending jobs. Waiting for completion.")
-        return 0
-
-    # Calculate how many more jobs we can create
-    available_slots = MAX_ACTIVE_JOBS - total_active_jobs
-
-    # Process in order, skipping months that are already in process or have pending manifests
-    for year_month, metric_files in files_by_month.items():
-        # Skip if this month is already being processed or has a pending manifest
-        if year_month in months_to_skip:
-            logger.info(f"Month {year_month} is already being processed or has a pending manifest, skipping")
-            continue
-
-        # Find matching accounting files
-        month_accounting_files = []
-        for acc_file in accounting_files:
-            if year_month in os.path.basename(acc_file):
-                month_accounting_files.append(acc_file)
-
-        if not month_accounting_files:
-            logger.warning(f"No accounting files found for {year_month}, skipping")
-            continue
-
-        # Create job ID
-        job_id = f"job_{year_month}_{uuid.uuid4().hex[:8]}"
-
-        # Create manifest
+        # Create manifest data
         manifest_data = {
             "job_id": job_id,
             "year_month": year_month,
-            "metric_files": [os.path.basename(f) for f in metric_files],
-            "accounting_files": [os.path.basename(f) for f in month_accounting_files],
+            "sorted_metric_files": sorted_file_names,
+            "metric_files": sorted_file_names,  # Include unsorted filenames for backward compatibility
+            "accounting_files": [],  # This processor doesn't need accounting files
             "complete_month": True,
             "timestamp": time.time()
         }
 
-        # Copy files to server
-        for file in metric_files + month_accounting_files:
-            dest_file = os.path.join(SERVER_INPUT_DIR, os.path.basename(file))
-            shutil.copy2(file, dest_file)
-            logger.info(f"Copied {file} to {dest_file}")
-
         # Write manifest file
-        manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
+        manifest_path = SERVER_INPUT_DIR / f"{job_id}.manifest.json"
         with open(manifest_path, 'w') as f:
-            print("Manifest data:")
-            print(manifest_data)
             json.dump(manifest_data, f)
+
+        logger.info(f"Created job manifest for folder {year_month} with job ID {job_id}")
 
         # Track this job
         active_jobs[job_id] = {
@@ -238,194 +209,251 @@ def distribute_jobs(files_by_month, accounting_files):
             "start_time": time.time()
         }
 
-        logger.info(f"Created job {job_id} for {year_month}")
-        jobs_created += 1
+        return job_id
 
-        # Check if we've reached the available slots limit
-        if jobs_created >= available_slots:
-            logger.info(f"Created {jobs_created} new jobs, reaching the limit of {MAX_ACTIVE_JOBS} total active jobs")
-            break
-
-    return jobs_created
+    except Exception as e:
+        logger.error(f"Error creating job manifest for folder {year_month}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
 
 
-def check_completed_jobs():
+def move_completed_folder_to_destination(year_month, logger):
+    """Move a completed folder from output to destination."""
+    try:
+        source_dir = SERVER_OUTPUT_DIR / year_month
+        destination_dir = DESTINATION_DIR / year_month
+
+        # Create destination directory if it doesn't exist
+        destination_dir.mkdir(exist_ok=True, parents=True)
+
+        # Get all processed files in the source directory
+        processed_files = list(source_dir.glob("joined_data_*.parquet"))
+
+        if not processed_files:
+            logger.warning(f"No processed files found in {source_dir}")
+            return False
+
+        logger.info(f"Moving {len(processed_files)} processed files from {source_dir} to {destination_dir}")
+
+        # Move each file
+        for file in processed_files:
+            dest_file = destination_dir / file.name
+
+            # Check if the file already exists at destination
+            if dest_file.exists():
+                logger.warning(f"File {dest_file} already exists, skipping")
+                continue
+
+            # Copy the file to destination
+            shutil.copy2(file, dest_file)
+
+            # Verify file was copied correctly
+            if dest_file.exists() and dest_file.stat().st_size == file.stat().st_size:
+                # Remove the source file
+                file.unlink()
+            else:
+                logger.error(f"Failed to verify copy of {file.name}")
+                return False
+
+        logger.info(f"Successfully moved folder {year_month} to destination")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error moving folder {year_month} to destination: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+def cleanup_completed_folder(year_month, logger):
+    """Clean up a folder after successful processing."""
+    try:
+        # Clean up input directory
+        input_folder = SERVER_INPUT_DIR / year_month
+        if input_folder.exists():
+            shutil.rmtree(input_folder)
+            logger.info(f"Removed folder {year_month} from input directory")
+
+        # Clean up output directory
+        output_folder = SERVER_OUTPUT_DIR / year_month
+        if output_folder.exists() and len(list(output_folder.glob("*"))) == 0:
+            output_folder.rmdir()
+            logger.info(f"Removed empty folder {year_month} from output directory")
+
+        # Clean up source directory if requested (only remove sorted files)
+        source_folder = SOURCE_DIR / year_month
+        if source_folder.exists():
+            # Find sorted files to delete (keep the original unsorted files)
+            sorted_files = list(source_folder.glob("sorted_perf_metrics_*.parquet"))
+            for file in sorted_files:
+                file.unlink()
+                logger.info(f"Removed sorted file {file.name} from source folder")
+
+            logger.info(f"Cleaned up sorted files in source folder {year_month}")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"Error cleaning up folder {year_month}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+def check_completed_jobs(logger):
     """Check for completed jobs and process their results."""
     completed_jobs = []
 
     for job_id in list(active_jobs.keys()):
-        status_file = os.path.join(SERVER_COMPLETE_DIR, f"{job_id}.status")
+        status_file = SERVER_COMPLETE_DIR / f"{job_id}.status"
 
-        if os.path.exists(status_file):
-            with open(status_file, 'r') as f:
-                status_data = json.load(f)
+        if status_file.exists():
+            try:
+                with open(status_file, 'r') as f:
+                    status_data = json.load(f)
 
-            if status_data.get("status") == "completed":
-                year_month = active_jobs[job_id]["year_month"]
-                logger.info(f"Job {job_id} for {year_month} completed")
+                status = status_data.get("status")
+                year_month = status_data.get("year_month")
 
-                # Move to final destination
-                process_completed_job(job_id, year_month)
-                completed_jobs.append(job_id)
+                if status == "completed" and year_month:
+                    logger.info(f"Job {job_id} for folder {year_month} completed")
+
+                    # Move folder to destination
+                    success = move_completed_folder_to_destination(year_month, logger)
+
+                    if success:
+                        # Clean up folders
+                        cleanup_completed_folder(year_month, logger)
+                        completed_jobs.append(job_id)
+
+                elif status == "failed" and year_month:
+                    logger.error(f"Job {job_id} for folder {year_month} failed")
+                    # Keep the input folder for investigation
+                    completed_jobs.append(job_id)
+
+            except Exception as e:
+                logger.error(f"Error checking status for job {job_id}: {str(e)}")
+                logger.error(traceback.format_exc())
 
     # Remove completed jobs from tracking
     for job_id in completed_jobs:
-        del active_jobs[job_id]
+        if job_id in active_jobs:
+            del active_jobs[job_id]
+
+            # Remove status file
+            status_file = SERVER_COMPLETE_DIR / f"{job_id}.status"
+            if status_file.exists():
+                status_file.unlink()
 
     return len(completed_jobs)
 
 
-def process_completed_job(job_id, year_month):
-    """
-    Move completed job data to final destination.
-    Verifies successful copying before deleting source files.
-    Also cleans up input files for completed jobs.
-    """
-    source_dir = os.path.join(SERVER_COMPLETE_DIR, job_id)
-    dest_dir = os.path.join(DESTINATION_DIR, year_month)
-    os.makedirs(dest_dir, exist_ok=True)
+def distribute_jobs(logger):
+    """Create job manifests and distribute work to consumer."""
+    jobs_created = 0
 
-    # Get all parquet files in the source directory
-    source_files = []
-    for file in os.listdir(source_dir):
-        if file.endswith(".parquet"):
-            source_files.append(os.path.join(source_dir, file))
+    # Check how many jobs the consumer is currently processing
+    active_consumer_jobs, active_folder_names = check_active_consumer_jobs()
 
-    if not source_files:
-        logger.warning(f"No parquet files found in {source_dir}")
-        return False
+    # Check for existing manifests in the input directory
+    existing_manifests = check_existing_manifests()
 
-    logger.info(f"Found {len(source_files)} files to copy for job {job_id}")
+    # Check for folders that have already been processed and moved to destination
+    completed_folders = check_completed_folders()
 
-    # Copy all files to destination
-    copied_count = 0
-    successful_copies = []
+    # Combine all folders that should be skipped
+    folders_to_skip = active_folder_names.union(existing_manifests).union(completed_folders)
 
-    for source_file in source_files:
-        file_name = os.path.basename(source_file)
-        dest_file = os.path.join(dest_dir, file_name)
+    logger.info(f"Folders to skip (in process, pending, or completed): {len(folders_to_skip)}")
 
-        try:
-            # Copy the file
-            shutil.copy2(source_file, dest_file)
+    # If the consumer is already at capacity, don't create more jobs
+    total_active_jobs = len(active_consumer_jobs) + len(existing_manifests)
+    if total_active_jobs >= MAX_ACTIVE_JOBS:
+        logger.info(
+            f"Already at maximum capacity with {len(active_consumer_jobs)} active jobs and {len(existing_manifests)} pending jobs")
+        return 0
 
-            # Verify file was copied correctly by checking existence and size
-            if os.path.exists(dest_file) and os.path.getsize(dest_file) == os.path.getsize(source_file):
-                copied_count += 1
-                successful_copies.append(source_file)
-                logger.info(f"Successfully copied: {file_name} to {dest_dir}")
+    # Calculate how many more jobs we can create
+    available_slots = MAX_ACTIVE_JOBS - total_active_jobs
+
+    # Find source folders
+    source_folders = find_source_folders()
+    logger.info(f"Found {len(source_folders)} potential source folders")
+
+    # Process folders, skipping those that are already in process or completed
+    for folder in source_folders:
+        year_month = folder.name
+
+        # Skip folders that are already being processed or completed
+        if year_month in folders_to_skip:
+            continue
+
+        # Check if folder has sorted files
+        sorted_files = list(folder.glob("sorted_perf_metrics_*.parquet"))
+
+        if sorted_files:
+            logger.info(f"Found {len(sorted_files)} sorted files in {year_month}")
+
+            # Copy folder to input directory
+            success = copy_folder_to_input(folder, logger)
+
+            if success:
+                # Create job manifest
+                job_id = create_job_manifest(year_month, sorted_files, logger)
+
+                if job_id:
+                    jobs_created += 1
+                    logger.info(f"Created job for folder {year_month}")
+
+                    # Check if we've reached the limit
+                    if jobs_created >= available_slots:
+                        logger.info(f"Created {jobs_created} new jobs, reaching limit")
+                        break
+        else:
+            # If no sorted files, check if there are unsorted files
+            unsorted_files = list(folder.glob("perf_metrics_*.parquet"))
+
+            if unsorted_files:
+                logger.info(f"Found {len(unsorted_files)} unsorted files in {year_month}, needs sorting first")
+                # These will be handled by the sorting process
             else:
-                logger.error(f"Verification failed for {dest_file}")
-        except Exception as e:
-            logger.error(f"Error copying {source_file} to {dest_file}: {str(e)}")
+                logger.warning(f"No metric files found in {year_month}")
 
-    # Check if all files were copied successfully
-    if copied_count == len(source_files):
-        logger.info(f"All {copied_count} files were successfully copied to destination")
-
-        # Delete original files from complete directory
-        deleted_count = 0
-        for file_path in successful_copies:
-            try:
-                os.remove(file_path)
-                deleted_count += 1
-            except Exception as e:
-                logger.error(f"Error deleting file {file_path}: {str(e)}")
-
-        logger.info(f"Deleted {deleted_count} original files after successful copying")
-
-        # Clean up input files for this job
-        try:
-            # Get the manifest file path
-            manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
-
-            # Check if manifest still exists (it might have been already removed by consumer)
-            if os.path.exists(manifest_path):
-                # Load the manifest to get list of files
-                with open(manifest_path, 'r') as f:
-                    manifest_data = json.load(f)
-
-                # Get the list of files to clean up
-                metric_files = manifest_data.get("metric_files", [])
-                accounting_files = manifest_data.get("accounting_files", [])
-                all_files = metric_files + accounting_files
-
-                # Delete each input file
-                input_deleted_count = 0
-                for file_name in all_files:
-                    file_path = os.path.join(SERVER_INPUT_DIR, file_name)
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        input_deleted_count += 1
-
-                # Delete the manifest file itself
-                if os.path.exists(manifest_path):
-                    os.remove(manifest_path)
-                    input_deleted_count += 1
-
-                logger.info(f"Cleaned up {input_deleted_count} input files for completed job {job_id}")
-            else:
-                logger.info(f"Manifest for job {job_id} already removed, skipping input cleanup")
-
-        except Exception as e:
-            logger.error(f"Error cleaning up input files for job {job_id}: {str(e)}")
-
-        # Try to remove the job directory if it's empty
-        try:
-            # Check if directory is empty after file removal
-            remaining_files = os.listdir(source_dir)
-            if not remaining_files:
-                shutil.rmtree(source_dir)
-                logger.info(f"Removed empty job directory {source_dir}")
-            else:
-                logger.warning(f"Job directory {source_dir} still contains {len(remaining_files)} files, not removing")
-        except Exception as e:
-            logger.error(f"Error removing job directory {source_dir}: {str(e)}")
-
-        # Remove the status file
-        try:
-            status_file = os.path.join(SERVER_COMPLETE_DIR, f"{job_id}.status")
-            if os.path.exists(status_file):
-                os.remove(status_file)
-                logger.info(f"Removed status file for job {job_id}")
-        except Exception as e:
-            logger.error(f"Error removing status file for job {job_id}: {str(e)}")
-
-        return True
-    else:
-        logger.warning(
-            f"Only {copied_count} out of {len(source_files)} files were copied successfully. Not deleting originals.")
-        return False
+    return jobs_created
 
 
 def main():
-    """Main producer function."""
+    """Main producer function that continuously monitors and distributes processing jobs."""
+    # Set up logging and directories
+    logger = setup_logging()
     setup_directories()
+
+    logger.info("Starting metrics processor producer")
+
+    cycle_count = 0
 
     while True:
         try:
-            logger.info("Starting ETL producer cycle")
+            cycle_start = time.time()
+            cycle_count += 1
+            logger.info(f"Starting producer cycle {cycle_count}")
 
-            # Find source files
-            metric_files, accounting_files = find_source_files()
+            # Check for completed jobs and process results
+            completed_count = check_completed_jobs(logger)
 
-            # Organize files by month
-            files_by_month = organize_by_month(metric_files)
+            # Create and distribute new jobs
+            created_count = distribute_jobs(logger)
 
-            # Create and distribute jobs
-            jobs_created = distribute_jobs(files_by_month, accounting_files)
-
-            # Check for completed jobs
-            jobs_completed = check_completed_jobs()
-
-            logger.info(f"ETL cycle complete: {jobs_created} jobs created, {jobs_completed} jobs completed")
+            # Log cycle statistics
+            cycle_duration = time.time() - cycle_start
+            logger.info(
+                f"Producer cycle {cycle_count} completed in {cycle_duration:.1f}s: {completed_count} jobs completed, {created_count} jobs created")
 
             # Sleep before next cycle
-            time.sleep(60)
+            time.sleep(60)  # One minute between cycles
 
         except Exception as e:
-            logger.error(f"Error in ETL producer cycle: {str(e)}")
-            time.sleep(30)
+            logger.error(f"Error in producer cycle: {str(e)}")
+            logger.error(traceback.format_exc())
+            time.sleep(30)  # Shorter sleep on error
 
 
 if __name__ == "__main__":
