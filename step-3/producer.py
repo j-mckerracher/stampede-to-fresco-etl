@@ -227,6 +227,8 @@ def distribute_jobs(files_by_month, accounting_files):
         # Write manifest file
         manifest_path = os.path.join(SERVER_INPUT_DIR, f"{job_id}.manifest.json")
         with open(manifest_path, 'w') as f:
+            print("Manifest data:")
+            print(manifest_data)
             json.dump(manifest_data, f)
 
         # Track this job

@@ -7,6 +7,12 @@ from pathlib import Path
 import polars as pl
 from datetime import timedelta, datetime
 import psutil
+from datetime import timedelta
+import gc
+import traceback
+import multiprocessing
+
+pl.enable_string_cache()
 
 
 def print_current_time():
@@ -29,16 +35,15 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()  # Keep console output as well
-        ]
+        logging.FileHandler(log_file),
+        logging.StreamHandler()  # Keep console output as well
+    ]
 )
 logger = logging.getLogger('job-metrics-consumer')
 
 SERVER_INPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/input"
 SERVER_OUTPUT_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/output"
 SERVER_COMPLETE_DIR = "/home/dynamo/a/jmckerra/projects/stampede-step-3/complete"
-NUM_THREADS = 10
 MAX_MEMORY_PERCENT = 80
 
 
@@ -160,95 +165,116 @@ def estimate_output_rows(job_metrics, start_time, end_time, hosts_count):
 
 
 def load_accounting_data(accounting_files):
-    """Load accounting data from CSV files with optimization."""
-    dfs = []
+    """Load accounting data from CSV files using LazyFrames."""
+    if not accounting_files:
+        logger.warning("No accounting files provided")
+        return pl.LazyFrame()
 
-    # Process files in parallel
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=min(NUM_THREADS, len(accounting_files))) as executor:
-        futures = []
+    # Define schema for better performance and reliability
+    schema = {
+        "jobID": pl.Utf8,
+        "user": pl.Utf8,
+        "account": pl.Utf8,
+        "jobname": pl.Utf8,
+        "queue": pl.Utf8,
+        "nnodes": pl.Int64,
+        "ncpus": pl.Int64,
+        "walltime": pl.Int64,
+        "start": pl.Utf8,
+        "end": pl.Utf8,
+        "submit": pl.Utf8,
+        "exit_status": pl.Utf8  # Using Utf8 since some values are text
+    }
 
-        for file_path in accounting_files:
-            futures.append(executor.submit(pl.read_csv, file_path))
+    lazy_frames = []
+    for file_path in accounting_files:
+        try:
+            # Use scan_csv to create LazyFrame
+            lf = pl.scan_csv(
+                file_path,
+                schema_overrides=schema,
+                low_memory=True,
+                ignore_errors=True
+            )
 
-        for future in futures:
-            try:
-                df = future.result()
-                # Parse date columns with correct format
-                df = df.with_columns([
-                    pl.col("start").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
-                    pl.col("end").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
-                    pl.col("submit").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S")
+            # Parse date columns with correct format
+            lf = lf.with_columns([
+                pl.col("start").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
+                pl.col("end").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S"),
+                pl.col("submit").str.strptime(pl.Datetime, format="%m/%d/%Y %H:%M:%S")
+            ])
+
+            lazy_frames.append(lf)
+            logger.info(f"Successfully scanned accounting file: {file_path}")
+        except Exception as e:
+            logger.error(f"Error scanning accounting file {file_path}: {str(e)}")
+
+    if lazy_frames:
+        result = pl.concat(lazy_frames)
+        logger.info(f"Created lazy accounting dataframe from {len(lazy_frames)} files")
+        return result
+    else:
+        return pl.LazyFrame()
+
+
+def load_metric_data(metric_files, time_filter=None):
+    """
+    Load metric data from Parquet files using LazyFrames with time filtering.
+
+    Args:
+        metric_files: List of metric file paths to load
+        time_filter: Optional tuple of (start_time, end_time) to filter data
+    """
+    if not metric_files:
+        logger.warning("No metric files provided")
+        return pl.LazyFrame()
+
+    # Only read essential columns that we need
+    columns_needed = ["Job Id", "Timestamp", "Host", "Event", "Value"]
+
+    lazy_frames = []
+    for file_path in metric_files:
+        try:
+            # Use scan_parquet to create LazyFrame
+            lf = pl.scan_parquet(file_path)
+
+            # Select only the columns we need
+            lf = lf.select(columns_needed)
+
+            # Parse Timestamp to datetime with the correct format
+            if "Timestamp" in lf.columns:
+                lf = lf.with_columns([
+                    pl.col("Timestamp").str.strptime(
+                        pl.Datetime,
+                        format="%Y-%m-%d %H:%M:%S",
+                        strict=False
+                    )
                 ])
-                dfs.append(df)
-                logger.info(f"Successfully loaded accounting file with {len(df)} rows")
-            except Exception as e:
-                logger.error(f"Error loading accounting file: {str(e)}")
 
-    if dfs:
-        result = pl.concat(dfs)
-        logger.info(f"Loaded {len(result)} total accounting rows")
+            # Apply time filter if provided
+            if time_filter and time_filter[0] and time_filter[1]:
+                start_time, end_time = time_filter
+                lf = lf.filter(
+                    (pl.col("Timestamp") >= start_time) &
+                    (pl.col("Timestamp") <= end_time)
+                )
+
+            # Filter to only keep relevant events
+            lf = lf.filter(
+                pl.col("Event").is_in(["cpuuser", "memused", "memused_minus_diskcache", "nfs", "block"])
+            )
+
+            lazy_frames.append(lf)
+            logger.info(f"Successfully scanned metric file: {file_path}")
+        except Exception as e:
+            logger.error(f"Error scanning metric file {file_path}: {str(e)}")
+
+    if lazy_frames:
+        result = pl.concat(lazy_frames)
+        logger.info(f"Created lazy metrics dataframe from {len(lazy_frames)} files")
         return result
     else:
-        return pl.DataFrame()
-
-
-def load_metric_data(metric_files):
-    """Load metric data from Parquet files with batch processing and memory optimization."""
-    dfs = []
-    total_files = len(metric_files)
-
-    # Process in smaller batches to manage memory
-    batch_size = 50  # Process 50 files at a time
-
-    for batch_start in range(0, total_files, batch_size):
-        batch_end = min(batch_start + batch_size, total_files)
-        current_batch = metric_files[batch_start:batch_end]
-
-        logger.info(f"Loading metric files batch {batch_start // batch_size + 1}/{(total_files - 1) // batch_size + 1}")
-
-        batch_dfs = []
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(NUM_THREADS, len(current_batch))) as executor:
-            futures = []
-
-            # Only read essential columns to save memory
-            columns = ["Job Id", "Timestamp", "Host", "Event", "Value"]
-
-            for file_path in current_batch:
-                futures.append(executor.submit(pl.read_parquet, file_path, columns=columns))
-
-            for future in futures:
-                try:
-                    df = future.result()
-                    # Ensure Timestamp column is datetime using parse_datetime_column
-                    if "Timestamp" in df.columns:
-                        df = parse_datetime_column(df, "Timestamp")
-                    batch_dfs.append(df)
-                except Exception as e:
-                    logger.error(f"Error loading metric file: {str(e)}")
-
-        if batch_dfs:
-            # Concatenate the batch and add to our list
-            batch_df = pl.concat(batch_dfs)
-            dfs.append(batch_df)
-            logger.info(f"Added batch with {len(batch_df)} rows")
-
-            # Check memory usage and wait if needed
-            memory_percent = psutil.virtual_memory().percent
-            if memory_percent > MAX_MEMORY_PERCENT:
-                logger.warning(f"Memory usage high ({memory_percent}%), waiting for GC")
-                import gc
-                gc.collect()
-                time.sleep(5)  # Wait a bit for memory to be freed
-
-    if dfs:
-        logger.info(f"Concatenating {len(dfs)} batches")
-        result = pl.concat(dfs)
-        logger.info(f"Loaded {len(result)} total metric rows")
-        return result
-    else:
-        return pl.DataFrame()
+        return pl.LazyFrame()
 
 
 def join_data(metric_df, accounting_df, output_dir, year_month):
@@ -256,11 +282,8 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
     Join metric data with accounting data using 5-minute time chunks.
     Optimized with batch processing and indexing.
     """
-    from datetime import timedelta
-    import gc
-
     # Create index on Job Id in metric_df to speed up filtering
-    logger.info("Creating indexes for faster joins")
+    # logger.info("Creating indexes for faster joins")
     # Extract unique job IDs from accounting data
     accounting_job_ids = accounting_df["jobID"].unique().to_list()
 
@@ -271,7 +294,7 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
     for i in range(0, len(accounting_df), batch_size):
         batches.append(accounting_df.slice(i, min(batch_size, len(accounting_df) - i)))
 
-    logger.info(f"Split accounting data into {len(batches)} batches for processing")
+    # logger.info(f"Split accounting data into {len(batches)} batches for processing")
 
     # Define common constants
     chunk_duration = timedelta(minutes=5)
@@ -291,11 +314,9 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
             start_time = job_row["start"]
             end_time = job_row["end"]
 
-            # Log progress for large batches
-            if job_idx % 100 == 0 or job_idx == len(batch_df) - 1:
-                logger.info(f"Processing job {job_idx + 1}/{len(batch_df)}")
-                memory_info = psutil.virtual_memory()
-                logger.info(f"Memory: {memory_info.percent}% ({memory_info.used / 1024 ** 3:.1f}GB)")
+            # # Log progress for large batches
+            # if job_idx % 100 == 0 or job_idx == len(batch_df) - 1:
+            #     logger.info(f"Processing job {job_idx + 1}/{len(batch_df)}")
 
             # Try different job ID formats - polars doesn't support regex so we create variations
             job_id_alt1 = f"JOB{job_id.replace('jobID', '')}" if "jobID" in job_id else f"JOB{job_id}"
@@ -401,7 +422,7 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
                     interim_file = os.path.join(batch_dir, f"joined_data_{year_month}_part{batch_num}.parquet")
                     interim_df.write_parquet(interim_file)
 
-                    logger.info(f"Wrote interim {len(interim_df)} rows to {interim_file}")
+                    # logger.info(f"Wrote interim {len(interim_df)} rows to {interim_file}")
                     all_batch_dirs.append(batch_dir)
                     batch_num += 1
 
@@ -417,7 +438,7 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
             batch_file = os.path.join(batch_dir, f"joined_data_{year_month}_batch{batch_num}.parquet")
             batch_df.write_parquet(batch_file)
 
-            logger.info(f"Wrote final {len(batch_df)} rows to {batch_file}")
+            # logger.info(f"Wrote final {len(batch_df)} rows to {batch_file}")
             all_batch_dirs.append(batch_dir)
             batch_num += 1
 
@@ -429,21 +450,208 @@ def join_data(metric_df, accounting_df, output_dir, year_month):
 
     # Remove duplicates from batch_dirs list
     unique_batch_dirs = list(set(all_batch_dirs))
-    logger.info(f"Completed join with {len(unique_batch_dirs)} output batch directories")
+    # logger.info(f"Completed join with {len(unique_batch_dirs)} output batch directories")
 
     return unique_batch_dirs
 
 
+def vectorized_join(metrics_lazy, accounting_lazy):
+    """
+    Perform vectorized join between metrics and accounting data using LazyFrames.
+
+    Args:
+        metrics_lazy: LazyFrame containing metric data
+        accounting_lazy: LazyFrame containing accounting data
+
+    Returns:
+        LazyFrame with joined data
+    """
+    # Create canonical job IDs for joining
+    metrics_lazy = metrics_lazy.with_columns([
+        pl.col("Job Id").alias("job_id_canonical")
+    ])
+
+    # Time bucket for metrics (5-minute intervals)
+    metrics_lazy = metrics_lazy.with_columns([
+        pl.col("Timestamp").dt.truncate("5m").alias("time_bucket")
+    ])
+
+    # Pre-aggregate metrics by job, host, time bucket, and event
+    metrics_agg = metrics_lazy.group_by(
+        ["job_id_canonical", "Host", "time_bucket", "Event"]
+    ).agg([
+        pl.col("Value").mean().alias("avg_value")
+    ])
+
+    # Create separate aggregations for each event type
+    cpuuser_metrics = metrics_agg.filter(pl.col("Event") == "cpuuser").select(
+        ["job_id_canonical", "Host", "time_bucket", pl.col("avg_value").alias("value_cpuuser")]
+    )
+
+    memused_metrics = metrics_agg.filter(pl.col("Event") == "memused").select(
+        ["job_id_canonical", "Host", "time_bucket", pl.col("avg_value").alias("value_memused")]
+    )
+
+    memused_minus_diskcache_metrics = metrics_agg.filter(pl.col("Event") == "memused_minus_diskcache").select(
+        ["job_id_canonical", "Host", "time_bucket", pl.col("avg_value").alias("value_memused_minus_diskcache")]
+    )
+
+    nfs_metrics = metrics_agg.filter(pl.col("Event") == "nfs").select(
+        ["job_id_canonical", "Host", "time_bucket", pl.col("avg_value").alias("value_nfs")]
+    )
+
+    block_metrics = metrics_agg.filter(pl.col("Event") == "block").select(
+        ["job_id_canonical", "Host", "time_bucket", pl.col("avg_value").alias("value_block")]
+    )
+
+    # Get distinct combinations of job, host, and time bucket as base
+    base_metrics = metrics_agg.select(["job_id_canonical", "Host", "time_bucket"]).unique()
+
+    # Join all event metrics to the base - using left joins
+    combined_metrics = base_metrics
+
+    # Use a sequence of left joins to combine all metrics
+    if "value_cpuuser" not in combined_metrics.columns:
+        combined_metrics = combined_metrics.join(
+            cpuuser_metrics,
+            on=["job_id_canonical", "Host", "time_bucket"],
+            how="left"
+        )
+
+    if "value_memused" not in combined_metrics.columns:
+        combined_metrics = combined_metrics.join(
+            memused_metrics,
+            on=["job_id_canonical", "Host", "time_bucket"],
+            how="left"
+        )
+
+    if "value_memused_minus_diskcache" not in combined_metrics.columns:
+        combined_metrics = combined_metrics.join(
+            memused_minus_diskcache_metrics,
+            on=["job_id_canonical", "Host", "time_bucket"],
+            how="left"
+        )
+
+    if "value_nfs" not in combined_metrics.columns:
+        combined_metrics = combined_metrics.join(
+            nfs_metrics,
+            on=["job_id_canonical", "Host", "time_bucket"],
+            how="left"
+        )
+
+    if "value_block" not in combined_metrics.columns:
+        combined_metrics = combined_metrics.join(
+            block_metrics,
+            on=["job_id_canonical", "Host", "time_bucket"],
+            how="left"
+        )
+
+    # Add GPU column which is always null
+    combined_metrics = combined_metrics.with_columns([
+        pl.lit(None).cast(pl.Float64).alias("value_gpu")
+    ])
+
+    # Prepare accounting data with multiple job ID formats
+    accounting_lazy = accounting_lazy.with_columns([
+        pl.col("jobID").alias("original_job_id")
+    ])
+
+    # Join with accounting data using the job_id_canonical field
+    # Try to match it against the jobID field in accounting
+    joined_data = combined_metrics.join(
+        accounting_lazy,
+        left_on="job_id_canonical",
+        right_on="jobID",
+        how="inner"
+    )
+
+    # Filter joined data by time boundaries
+    joined_data = joined_data.filter(
+        (pl.col("time_bucket") >= pl.col("start")) &
+        (pl.col("time_bucket") <= pl.col("end"))
+    )
+
+    # Duplicate rows for each unit type - one LazyFrame per unit type
+    cpu_pct = joined_data.with_columns([
+        pl.lit("CPU %").alias("unit"),
+        pl.col("time_bucket").alias("time"),
+        pl.col("submit").alias("submit_time"),
+        pl.col("start").alias("start_time"),
+        pl.col("end").alias("end_time"),
+        pl.col("walltime").alias("timelimit"),
+        pl.col("nnodes").alias("nhosts"),
+        pl.col("ncpus").alias("ncores"),
+        pl.col("jobID").alias("jid"),
+        pl.col("Host").alias("host")
+    ])
+
+    gb = joined_data.with_columns([
+        pl.lit("GB").alias("unit"),
+        pl.col("time_bucket").alias("time"),
+        pl.col("submit").alias("submit_time"),
+        pl.col("start").alias("start_time"),
+        pl.col("end").alias("end_time"),
+        pl.col("walltime").alias("timelimit"),
+        pl.col("nnodes").alias("nhosts"),
+        pl.col("ncpus").alias("ncores"),
+        pl.col("jobID").alias("jid"),
+        pl.col("Host").alias("host")
+    ])
+
+    gb_s = joined_data.with_columns([
+        pl.lit("GB/s").alias("unit"),
+        pl.col("time_bucket").alias("time"),
+        pl.col("submit").alias("submit_time"),
+        pl.col("start").alias("start_time"),
+        pl.col("end").alias("end_time"),
+        pl.col("walltime").alias("timelimit"),
+        pl.col("nnodes").alias("nhosts"),
+        pl.col("ncpus").alias("ncores"),
+        pl.col("jobID").alias("jid"),
+        pl.col("Host").alias("host")
+    ])
+
+    mb_s = joined_data.with_columns([
+        pl.lit("MB/s").alias("unit"),
+        pl.col("time_bucket").alias("time"),
+        pl.col("submit").alias("submit_time"),
+        pl.col("start").alias("start_time"),
+        pl.col("end").alias("end_time"),
+        pl.col("walltime").alias("timelimit"),
+        pl.col("nnodes").alias("nhosts"),
+        pl.col("ncpus").alias("ncores"),
+        pl.col("jobID").alias("jid"),
+        pl.col("Host").alias("host")
+    ])
+
+    # Combine all unit types
+    result = pl.concat([cpu_pct, gb, gb_s, mb_s])
+
+    # Add missing columns that the original data had
+    result = result.with_columns([
+        pl.lit("").alias("host_list"),
+        pl.col("user").alias("username"),
+        pl.col("jobname").alias("jobname"),
+        pl.col("account").alias("account"),
+        pl.col("queue").alias("queue"),
+        pl.col("exit_status").alias("exitcode")
+    ])
+
+    return result
+
+
 def process_job(job_id, year_month, metric_files, accounting_files):
-    """Process a job with optimized data loading and joining."""
+    """Process a job with LazyFrames for loading but DataFrame for processing."""
     try:
         start_time = time.time()
         logger.info(f"Processing job {job_id} for {year_month}")
 
-        # Load accounting data first (usually smaller)
+        # Load accounting data using LazyFrames
         logger.info(f"Loading accounting data from {len(accounting_files)} files")
-        accounting_df = load_accounting_data(accounting_files)
+        accounting_lazy = load_accounting_data(accounting_files)
 
+        # Check if accounting data is empty
+        accounting_df = accounting_lazy.collect()
         if len(accounting_df) == 0:
             logger.error(f"No accounting data found for job {job_id}")
             save_status(job_id, "failed", {"error": "No accounting data found"})
@@ -451,65 +659,240 @@ def process_job(job_id, year_month, metric_files, accounting_files):
 
         logger.info(f"Accounting data loaded with {len(accounting_df)} rows in {time.time() - start_time:.1f}s")
 
-        # Load metric data (usually larger)
-        metric_load_start = time.time()
-        logger.info(f"Loading metric data from {len(metric_files)} files")
-        metric_df = load_metric_data(metric_files)
-
-        if len(metric_df) == 0:
-            logger.error(f"No metric data found for job {job_id}")
-            save_status(job_id, "failed", {"error": "No metric data found"})
-            return False
-
-        logger.info(f"Metric data loaded with {len(metric_df)} rows in {time.time() - metric_load_start:.1f}s")
-
         # Setup output directory
         output_dir = Path(SERVER_OUTPUT_DIR) / job_id
         os.makedirs(output_dir, exist_ok=True)
 
-        # Join the data
-        join_start = time.time()
-        logger.info("Joining metric and accounting data")
-        batch_dirs = join_data(metric_df, accounting_df, str(output_dir), year_month)
+        # Group accounting jobs by time windows (weeks)
+        accounting_df = accounting_df.with_columns([
+            pl.col("start").dt.week().alias("week_num")
+        ])
 
-        logger.info(f"Data joining completed in {time.time() - join_start:.1f}s")
+        # Get unique weeks
+        weeks = accounting_df["week_num"].unique().sort().to_list()
+        logger.info(f"Split accounting data into {len(weeks)} weekly time windows")
 
-        # Free memory
-        del metric_df
-        del accounting_df
-        import gc
-        gc.collect()
+        all_batch_dirs = []
+        batch_num = 1
+
+        # Process each time window separately
+        for week_idx, week in enumerate(weeks):
+            week_start_time = time.time()
+            logger.info(f"Processing time window {week_idx + 1}/{len(weeks)} (week {week})")
+
+            # Filter accounting jobs for this week
+            week_accounting = accounting_df.filter(pl.col("week_num") == week)
+            total_jobs_in_week = len(week_accounting)
+
+            logger.info(f"Found {total_jobs_in_week} jobs in time window {week_idx + 1}")
+
+            # Get overall time range for this week
+            week_start = week_accounting["start"].min()
+            week_end = week_accounting["end"].max()
+
+            logger.info(f"Time window {week_idx + 1} spans {week_start} to {week_end} with {total_jobs_in_week} jobs")
+
+            # Load only metric data for this time window using LazyFrames
+            metric_load_start = time.time()
+            logger.info(f"Loading metrics for time window {week_idx + 1} from {len(metric_files)} files")
+
+            week_metrics_lazy = load_metric_data(metric_files, time_filter=(week_start, week_end))
+
+            # Collect the metrics data - this materializes it
+            week_metrics = week_metrics_lazy.collect()
+
+            if len(week_metrics) == 0:
+                logger.warning(f"No metrics found for time window {week_idx + 1}")
+                continue
+
+            logger.info(
+                f"Loaded {len(week_metrics)} metric rows for time window {week_idx + 1} in {time.time() - metric_load_start:.1f}s")
+
+            # Create a batch directory
+            batch_dir = os.path.join(output_dir, f"batch_{batch_num}")
+            os.makedirs(batch_dir, exist_ok=True)
+
+            # Process the data with vectorized operations
+            join_start = time.time()
+            logger.info(f"Processing data for time window {week_idx + 1}")
+
+            # Prepare a results container
+            results = []
+
+            # Add time buckets (5-minute intervals)
+            week_metrics = week_metrics.with_columns([
+                pl.col("Timestamp").dt.truncate("5m").alias("time_bucket")
+            ])
+
+            # Pre-aggregate metrics by job, host, time bucket, and event
+            metrics_agg = week_metrics.group_by(
+                ["Job Id", "Host", "time_bucket", "Event"]
+            ).agg([
+                pl.col("Value").mean().alias("avg_value")
+            ])
+
+            # Process each job in this time window
+            processed_jobs = 0
+            for job_row in week_accounting.iter_rows(named=True):
+                job_id_value = job_row["jobID"]
+                job_id_alt1 = f"JOB{job_id_value.replace('jobID', '')}" if 'jobID' in job_id_value else f"JOB{job_id_value}"
+                job_id_alt2 = f"JOBID{job_id_value.replace('jobID', '')}" if 'jobID' in job_id_value else f"JOBID{job_id_value}"
+
+                # Filter metrics for this job
+                job_metrics = metrics_agg.filter(
+                    ((pl.col("Job Id") == job_id_value) |
+                     (pl.col("Job Id") == job_id_alt1) |
+                     (pl.col("Job Id") == job_id_alt2))
+                )
+
+                if len(job_metrics) == 0:
+                    continue
+
+                # Track progress
+                processed_jobs += 1
+                if processed_jobs % 100 == 0:
+                    logger.info(f"Processed {processed_jobs}/{total_jobs_in_week} jobs for time window {week_idx + 1}")
+
+                # Get hosts for this job
+                hosts = job_metrics["Host"].unique().to_list()
+                host_list_str = ",".join(hosts)
+
+                # Process each host and event
+                for host in hosts:
+                    # Filter metrics for this host
+                    host_metrics = job_metrics.filter(pl.col("Host") == host)
+
+                    # Get all time buckets for this host within the job's time range
+                    time_buckets = host_metrics.filter(
+                        (pl.col("time_bucket") >= job_row["start"]) &
+                        (pl.col("time_bucket") <= job_row["end"])
+                    )["time_bucket"].unique().to_list()
+
+                    # Process each time bucket
+                    for time_bucket in time_buckets:
+                        # Get metrics for this time bucket
+                        bucket_metrics = host_metrics.filter(pl.col("time_bucket") == time_bucket)
+
+                        # Convert to a dict for easier lookup
+                        metrics_dict = {}
+                        for m_row in bucket_metrics.iter_rows(named=True):
+                            metrics_dict[m_row["Event"]] = m_row["avg_value"]
+
+                        # Create rows for each unit type
+                        for unit in ["CPU %", "GB", "GB/s", "MB/s"]:
+                            row = {
+                                "time": time_bucket,
+                                "submit_time": job_row["submit"],
+                                "start_time": job_row["start"],
+                                "end_time": job_row["end"],
+                                "timelimit": job_row["walltime"],
+                                "nhosts": job_row["nnodes"],
+                                "ncores": job_row["ncpus"],
+                                "account": job_row["account"],
+                                "queue": job_row["queue"],
+                                "host": host,
+                                "jid": job_id_value,
+                                "unit": unit,
+                                "jobname": job_row["jobname"],
+                                "exitcode": job_row["exit_status"],
+                                "host_list": host_list_str,
+                                "username": job_row["user"],
+                                "value_cpuuser": metrics_dict.get("cpuuser", None),
+                                "value_gpu": None,  # Not present in data
+                                "value_memused": metrics_dict.get("memused", None),
+                                "value_memused_minus_diskcache": metrics_dict.get("memused_minus_diskcache", None),
+                                "value_nfs": metrics_dict.get("nfs", None),
+                                "value_block": metrics_dict.get("block", None)
+                            }
+
+                            results.append(row)
+
+                # Save partial results if memory usage is high or we've processed many jobs
+                if processed_jobs % 1000 == 0 or len(results) > 100000:
+                    memory_percent = psutil.virtual_memory().percent
+                    if memory_percent > MAX_MEMORY_PERCENT * 0.8 or len(results) > 100000:
+                        if results:
+                            logger.info(
+                                f"Saving partial results ({len(results)} rows) after processing {processed_jobs} jobs")
+                            partial_df = pl.DataFrame(results)
+                            partial_file = os.path.join(batch_dir,
+                                                        f"joined_data_{year_month}_week{week}_part{processed_jobs}.parquet")
+                            partial_df.write_parquet(partial_file, compression="zstd", compression_level=3)
+                            results = []  # Clear results
+                            gc.collect()  # Force garbage collection
+
+            # Save any remaining results
+            if results:
+                logger.info(f"Saving final results ({len(results)} rows) for time window {week_idx + 1}")
+                result_df = pl.DataFrame(results)
+                result_file = os.path.join(batch_dir, f"joined_data_{year_month}_week{week}_final.parquet")
+                result_df.write_parquet(result_file, compression="zstd", compression_level=3)
+
+            logger.info(
+                f"Processed {processed_jobs} jobs for time window {week_idx + 1} in {time.time() - join_start:.1f}s")
+
+            # Only add the batch directory if we processed some jobs
+            if processed_jobs > 0:
+                all_batch_dirs.append(batch_dir)
+                batch_num += 1
+
+            # Force garbage collection
+            gc.collect()
 
         # Copy results to complete directory
-        copy_start = time.time()
-        complete_dir = Path(SERVER_COMPLETE_DIR) / job_id
-        os.makedirs(complete_dir, exist_ok=True)
+        if all_batch_dirs:
+            copy_start = time.time()
+            logger.info(f"Copying results from {len(all_batch_dirs)} batch directories")
 
-        copied_files = []
-        for batch_dir in batch_dirs:
-            for file_name in os.listdir(batch_dir):
-                if file_name.endswith(".parquet"):
+            complete_dir = Path(SERVER_COMPLETE_DIR) / job_id
+            os.makedirs(complete_dir, exist_ok=True)
+
+            copied_files = []
+            total_files = sum(len([f for f in os.listdir(d) if f.endswith(".parquet")]) for d in all_batch_dirs)
+            files_copied = 0
+            last_copy_progress = 0
+
+            for batch_dir in all_batch_dirs:
+                parquet_files = [f for f in os.listdir(batch_dir) if f.endswith(".parquet")]
+                for i, file_name in enumerate(parquet_files):
                     source_file = os.path.join(batch_dir, file_name)
                     dest_file = os.path.join(complete_dir, file_name)
 
-                    # Copy the file
                     shutil.copy2(source_file, dest_file)
                     copied_files.append(dest_file)
 
-        logger.info(f"Copied {len(copied_files)} files in {time.time() - copy_start:.1f}s")
+                    # Update copy progress
+                    files_copied += 1
+                    copy_progress = int(100 * files_copied / total_files)
 
-        # Update job status
-        total_time = time.time() - start_time
-        save_status(job_id, "completed", {
-            "year_month": year_month,
-            "total_batches": len(batch_dirs),
-            "files_copied": len(copied_files),
-            "processing_time_seconds": total_time,
-            "ready_for_final_destination": True
-        })
+                    if copy_progress >= last_copy_progress + 10 or files_copied == total_files:
+                        logger.info(f"Copy progress: {copy_progress}% ({files_copied}/{total_files} files)")
+                        last_copy_progress = copy_progress
 
-        logger.info(f"Job {job_id} completed successfully in {total_time:.1f}s")
-        return True
+            copy_time = time.time() - copy_start
+            logger.info(f"Copied {len(copied_files)} files in {copy_time:.1f}s")
+
+            # Update job status
+            total_time = time.time() - start_time
+            save_status(job_id, "completed", {
+                "year_month": year_month,
+                "total_weeks_processed": len(weeks),
+                "total_batches": len(all_batch_dirs),
+                "files_copied": len(copied_files),
+                "processing_time_seconds": total_time,
+                "ready_for_final_destination": True
+            })
+
+            logger.info(f"Job {job_id} completed successfully in {total_time:.1f}s")
+            return True
+        else:
+            logger.warning(f"No data processed for job {job_id}")
+            save_status(job_id, "completed_no_data", {
+                "year_month": year_month,
+                "total_weeks_processed": len(weeks),
+                "processing_time_seconds": time.time() - start_time,
+            })
+            return True
 
     except Exception as e:
         logger.error(f"Error processing job {job_id}: {str(e)}")
@@ -534,23 +917,28 @@ def process_manifest(manifest_path):
     else:
         logger.error(f"Failed to process manifest {manifest_path}")
 
-    # Remove manifest even if processing failed
-    try:
-        os.remove(manifest_path)
-        logger.info(f"Removed manifest {manifest_path}")
-    except Exception as e:
-        logger.error(f"Error removing manifest {manifest_path}: {str(e)}")
-
 
 def main():
     """Main ETL consumer function with optimized processing and monitoring."""
     setup_directories()
 
+    # Configure optimal thread count
+    import multiprocessing
+    global NUM_THREADS
+    NUM_THREADS = max(10, min(16, multiprocessing.cpu_count()))
+
+    # Enable string cache globally to handle categorical data
+    pl.enable_string_cache()
+
     logger.info(f"Starting ETL consumer with {NUM_THREADS} threads and {MAX_MEMORY_PERCENT}% memory limit")
+
+    cycle_count = 0
 
     while True:
         try:
-            logger.info("Starting ETL consumer cycle")
+            cycle_start = time.time()
+            cycle_count += 1
+            logger.info(f"Starting ETL consumer cycle {cycle_count}")
 
             # Report system status
             memory_info = psutil.virtual_memory()
@@ -563,10 +951,14 @@ def main():
             if manifest_files:
                 logger.info(f"Found {len(manifest_files)} manifests to process")
 
-                # Process each manifest sequentially for stability
-                # This is safer than parallel processing for large data jobs
+                # Process each manifest sequentially
                 for manifest_path in manifest_files:
                     try:
+                        # Get the manifest name for logging
+                        manifest_name = os.path.basename(manifest_path)
+                        logger.info(f"Processing manifest {manifest_name}")
+
+                        # Process this manifest
                         process_manifest(manifest_path)
 
                         # Check memory after each job
@@ -578,15 +970,12 @@ def main():
                         logger.error(f"Error processing manifest {manifest_path}: {str(e)}")
                         import traceback
                         logger.error(traceback.format_exc())
-
-                        # Try to remove the manifest even if processing failed
-                        try:
-                            os.remove(manifest_path)
-                            logger.info(f"Removed problematic manifest {manifest_path}")
-                        except:
-                            logger.error(f"Could not remove manifest {manifest_path}")
             else:
                 logger.info("No manifests found, waiting...")
+
+            # Log cycle duration
+            cycle_duration = time.time() - cycle_start
+            logger.info(f"ETL consumer cycle {cycle_count} completed in {cycle_duration:.1f}s")
 
             # Sleep before next cycle
             time.sleep(10)
