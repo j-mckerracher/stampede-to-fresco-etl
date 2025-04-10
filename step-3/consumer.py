@@ -67,12 +67,60 @@ def load_job_from_manifest(manifest_path):
 
     job_id = manifest_data["job_id"]
     year_month = manifest_data["year_month"]
-    metric_files = [os.path.join(SERVER_INPUT_DIR, f) for f in manifest_data["metric_files"]]
 
-    # The metric files are now sorted, so we expect filenames starting with "sorted_"
-    sorted_metric_files = [os.path.join(SERVER_INPUT_DIR, f) for f in manifest_data.get("sorted_metric_files", [])]
+    # Define possible directories to look in
+    base_dir = SERVER_INPUT_DIR
+    year_month_dir = os.path.join(SERVER_INPUT_DIR, year_month)
 
-    accounting_files = [os.path.join(SERVER_INPUT_DIR, f) for f in manifest_data["accounting_files"]]
+    # Check if metric files exist, looking in both base and year_month directories
+    metric_files = manifest_data["metric_files"]
+    existing_metric_files = []
+
+    for f in metric_files:
+        base_path = os.path.join(base_dir, f)
+        year_month_path = os.path.join(year_month_dir, os.path.basename(f))
+
+        if os.path.exists(base_path):
+            existing_metric_files.append(base_path)
+        elif os.path.exists(year_month_path):
+            existing_metric_files.append(year_month_path)
+            logger.info(f"Found metric file in year-month directory: {year_month_path}")
+
+    if len(existing_metric_files) != len(metric_files):
+        logger.warning(
+            f"Some metric files don't exist. Expected {len(metric_files)}, found {len(existing_metric_files)}")
+
+    # Check if sorted metric files exist, looking in both base and year_month directories
+    sorted_metric_files = manifest_data.get("sorted_metric_files", [])
+    existing_sorted_files = []
+
+    for f in sorted_metric_files:
+        base_path = os.path.join(base_dir, f)
+        year_month_path = os.path.join(year_month_dir, os.path.basename(f))
+
+        if os.path.exists(base_path):
+            existing_sorted_files.append(base_path)
+        elif os.path.exists(year_month_path):
+            existing_sorted_files.append(year_month_path)
+            logger.info(f"Found sorted metric file in year-month directory: {year_month_path}")
+
+    if len(existing_sorted_files) != len(sorted_metric_files):
+        logger.warning(
+            f"Some sorted metric files don't exist. Expected {len(sorted_metric_files)}, found {len(existing_sorted_files)}")
+
+    # Check if accounting files exist (these appear to be in the base directory)
+    accounting_files = [os.path.join(base_dir, f) for f in manifest_data["accounting_files"]]
+    existing_accounting_files = [f for f in accounting_files if os.path.exists(f)]
+
+    if len(existing_accounting_files) != len(accounting_files):
+        logger.warning(
+            f"Some accounting files don't exist. Expected {len(accounting_files)}, found {len(existing_accounting_files)}")
+
+    # Use existing files only
+    metric_files = existing_metric_files
+    sorted_metric_files = existing_sorted_files
+    accounting_files = existing_accounting_files
+
     complete_month = manifest_data["complete_month"]
 
     return job_id, year_month, metric_files, sorted_metric_files, accounting_files, complete_month
@@ -199,14 +247,6 @@ def load_accounting_data(accounting_files):
 
 
 def load_sorted_metric_data(sorted_files, time_filter=None):
-    """
-    Load pre-sorted metric data from Parquet files using LazyFrames with time filtering.
-    This function takes advantage of data already being sorted by Job Id and Timestamp.
-
-    Args:
-        sorted_files: List of sorted metric file paths to load
-        time_filter: Optional tuple of (start_time, end_time) to filter data
-    """
     if not sorted_files:
         logger.warning("No sorted metric files provided")
         return pl.LazyFrame()
@@ -219,6 +259,30 @@ def load_sorted_metric_data(sorted_files, time_filter=None):
         try:
             # Use scan_parquet to create LazyFrame
             lf = pl.scan_parquet(file_path)
+
+            # Log the schema and columns
+            # logger.info(f"Scanned parquet file: {file_path}")
+            schema = lf.schema
+            # logger.info(f"Schema: {schema}")
+            # logger.info(f"Columns: {lf.columns}")
+
+            # Check if all required columns exist
+            missing_columns = [col for col in columns_needed if col not in lf.columns]
+            if missing_columns:
+                logger.error(f"Missing required columns in {file_path}: {missing_columns}")
+                # Try to adapt to potential column naming differences
+                column_mapping = {}
+                # Check for case differences
+                for needed_col in missing_columns:
+                    for actual_col in lf.columns:
+                        if needed_col.lower() == actual_col.lower():
+                            column_mapping[actual_col] = needed_col
+                            logger.info(f"Found column with different case: {actual_col} -> {needed_col}")
+
+                # Rename columns if mapping was found
+                if column_mapping:
+                    lf = lf.rename(column_mapping)
+                    logger.info(f"Renamed columns: {column_mapping}")
 
             # Select only the columns we need
             lf = lf.select(columns_needed)
@@ -253,28 +317,32 @@ def load_sorted_metric_data(sorted_files, time_filter=None):
             logger.info(f"Successfully scanned sorted metric file: {file_path}")
         except Exception as e:
             logger.error(f"Error scanning sorted metric file {file_path}: {str(e)}")
+            logger.error(traceback.format_exc())
 
     if lazy_frames:
         result = pl.concat(lazy_frames)
+        # Log information about the concatenated frame
         logger.info(f"Created lazy metrics dataframe from {len(lazy_frames)} files")
+        logger.info(f"Columns after concat: {result.columns}")
         return result
     else:
+        logger.warning("No valid lazy frames created, returning empty LazyFrame")
         return pl.LazyFrame()
 
 
 def efficient_job_processing(sorted_metrics_df, accounting_df, output_dir, year_month):
     """
     Process job metrics and accounting data efficiently using the pre-sorted metrics data.
-
-    Args:
-        sorted_metrics_df: DataFrame with metrics sorted by Job Id and Timestamp
-        accounting_df: DataFrame with accounting data
-        output_dir: Directory to write output files
-        year_month: Year and month for labeling output files
-
-    Returns:
-        List of batch directories containing output files
     """
+    # Validate inputs
+    logger.info(f"Starting efficient_job_processing with metrics shape: {sorted_metrics_df.shape}")
+    logger.info(f"Accounting shape: {accounting_df.shape}")
+
+    # Check if metrics dataframe has expected columns
+    if "Job Id" not in sorted_metrics_df.columns:
+        logger.error(f"Metrics dataframe missing 'Job Id' column. Available columns: {sorted_metrics_df.columns}")
+        return []
+
     # Create batch processing for accounting data
     batch_size = max(100, len(accounting_df) // multiprocessing.cpu_count())
     batches = []
@@ -325,7 +393,7 @@ def efficient_job_processing(sorted_metrics_df, accounting_df, output_dir, year_
             # Log progress periodically
             if job_idx % 200 == 0 and job_idx > 0:
                 elapsed = time.time() - batch_start_time
-                logger.info(f"Processed {job_idx}/{len(batch_df)} jobs in {elapsed:.1f}s")
+                # logger.info(f"Processed {job_idx}/{len(batch_df)} jobs in {elapsed:.1f}s")
 
                 # Check memory and write interim results if needed
                 memory_percent = psutil.virtual_memory().percent
@@ -506,6 +574,23 @@ def process_job(job_id, year_month, metric_files, sorted_metric_files, accountin
             # Load metric data using LazyFrames with sorted files
             metrics_lazy = load_sorted_metric_data(sorted_metric_files)
             metrics_df = metrics_lazy.collect()
+
+            # Validate metrics dataframe
+            logger.info(f"Collected metrics dataframe with {len(metrics_df)} rows")
+            logger.info(f"Metrics columns: {metrics_df.columns}")
+
+            if len(metrics_df) == 0:
+                logger.error(f"No metric data found for job {job_id}")
+                save_status(job_id, "failed", {"error": "No metric data found"})
+                return False
+
+            # Check if required columns exist
+            required_columns = ["Job Id", "Timestamp", "Host", "Event", "Value"]
+            missing_columns = [col for col in required_columns if col not in metrics_df.columns]
+            if missing_columns:
+                logger.error(f"Missing required columns in metrics data: {missing_columns}")
+                save_status(job_id, "failed", {"error": f"Missing required columns: {missing_columns}"})
+                return False
 
             # Process job data efficiently with pre-sorted metrics
             batch_dirs = efficient_job_processing(metrics_df, accounting_df, output_dir, year_month)

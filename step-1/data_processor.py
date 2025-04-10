@@ -1,10 +1,10 @@
-import os
 import logging
-import multiprocessing
-from typing import List
-from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from typing import Union
+
 import polars as pl
+from pathlib import Path
+import logging
+import os
 
 # Set up logging
 logging.basicConfig(
@@ -17,294 +17,388 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Constants ---
+SECTOR_SIZE_BYTES = 512
+BYTES_TO_GB = 1 / (1024 ** 3)
+BYTES_TO_MB = 1 / (1024 ** 2)
+MIN_TIME_DELTA_SECONDS = 0.1  # Minimum interval for rate calculation
+
 
 class NodeDataProcessor:
     """Process node data files using Polars to transform Stampede data into Anvil format
 
     The Anvil format standardizes resource usage metrics across multiple HPC systems
     with a common schema: Job Id, Host, Timestamp, Event, Value, Units.
-    This processor handles the transformation of block I/O, CPU usage, NFS traffic,
-    and memory metrics into this unified format.
+    This processor handles the transformation of block I/O, CPU usage, Lustre traffic,
+    and memory metrics into this unified format, assuming host-level aggregation
+    is desired for block, CPU, and Lustre metrics based on typical HPC monitoring needs.
+    Memory is processed per-node as specified in context.
     """
 
-    def __init__(self):
-        self.cache_dir = Path('cache')
+    def __init__(self, cache_dir: str = 'cache'):
+        self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"NodeDataProcessor initialized. Cache directory: {self.cache_dir}")
 
-    def process_block_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform block device metrics into Anvil format
+    # --- Helper Function for Robust Reading ---
+    def _read_csv_robust(self, file_path: Path, dtypes: dict = None) -> Union[pl.DataFrame, None]:
+        """Reads a CSV using Polars with basic error handling."""
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            logger.warning(f"File does not exist or is empty: {file_path}")
+            return None
+        try:
+            # Use infer_schema_length=0 to rely on dtypes or let polars infer fully
+            # null_values handles potential non-standard nulls if needed
+            # ignore_errors=True can skip bad rows but might hide issues
+            df = pl.read_csv(file_path, dtypes=dtypes, infer_schema_length=1000, ignore_errors=False)
+            if df.height == 0:
+                logger.warning(f"Read file {file_path}, but it resulted in an empty DataFrame.")
+                return None
+            return df
+        except Exception as e:
+            logger.error(f"Failed to read or parse CSV file {file_path}: {e}")
+            return None
 
-        Calculates block device throughput (GB/s) by:
-        1. Summing read and write sectors (512 bytes each)
-        2. Dividing by the time spent on I/O operations (in milliseconds)
-        3. Converting to GB/s for Anvil's standardized reporting
+    # --- Processing Functions ---
+
+    def process_block_file(self, file_path: Path) -> Union[pl.DataFrame, None]:
+        """Transform block device metrics into Anvil format (Host Aggregated GB/s).
+
+        Calculates block device throughput rate (GB/s) over wall-clock time
+        by:
+        1. Summing cumulative read/write sectors across all devices per host/timestamp.
+        2. Calculating the change (delta) in total sectors between consecutive timestamps.
+        3. Calculating the change (delta) in wall-clock time.
+        4. Calculating Rate = (Sector Delta * 512 Bytes) / Time Delta (seconds).
+        5. Converting Bytes/s to GB/s.
         """
         logger.info(f"Processing block file: {file_path}")
+        df = self._read_csv_robust(file_path, dtypes={'rd_sectors': pl.Float64, 'wr_sectors': pl.Float64})
+        if df is None: return None
+
         try:
-            df = pl.read_csv(file_path)
-
-            # Calculate throughput
-            # Convert sector and tick columns to numeric for calculations
+            # 1. Prepare data: Cast, Parse Timestamp, Calculate total sectors per row
             df = df.with_columns([
-                pl.col('rd_sectors').cast(pl.Float64).alias('rd_sectors_num'),
-                pl.col('wr_sectors').cast(pl.Float64).alias('wr_sectors_num'),
-                pl.col('rd_ticks').cast(pl.Float64).alias('rd_ticks_num'),
-                pl.col('wr_ticks').cast(pl.Float64).alias('wr_ticks_num')
+                pl.col('rd_sectors').fill_null(0).cast(pl.Float64),
+                pl.col('wr_sectors').fill_null(0).cast(pl.Float64),
+                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S", strict=False).alias('Timestamp'),
+                (pl.col('rd_sectors') + pl.col('wr_sectors')).alias('total_sectors')
+            ]).drop_nulls(subset=['Timestamp', 'jobID', 'node'])  # Need these for grouping/diff
+
+            # 2. Aggregate sectors per host/timestamp
+            group_keys_ts = ['jobID', 'node', 'Timestamp']
+            aggregated_df = df.group_by(group_keys_ts, maintain_order=True).agg(
+                pl.sum('total_sectors').alias('sum_total_sectors')
+            )
+
+            # 3. Calculate deltas within each host group
+            group_keys_host = ['jobID', 'node']
+            # Ensure sorting before applying window functions like diff
+            aggregated_df = aggregated_df.sort(group_keys_ts)
+
+            diff_df = aggregated_df.with_columns([
+                pl.col('sum_total_sectors').diff().over(group_keys_host).alias('sector_delta'),
+                pl.col('Timestamp').diff().over(group_keys_host).dt.total_seconds().alias('time_delta_seconds')
             ])
 
-            # Total sectors represent data volume (each sector = 512 bytes)
-            # Total ticks represent time spent on I/O (in milliseconds, converted to seconds)
-            df = df.with_columns([
-                (pl.col('rd_sectors_num') + pl.col('wr_sectors_num')).alias('total_sectors'),
-                ((pl.col('rd_ticks_num') + pl.col('wr_ticks_num')) / 1000).alias('total_ticks')
-            ])
+            # 4. Calculate Rate (GB/s)
+            # Filter out invalid deltas (first entry per group, negative sector delta, too small time delta)
+            rate_df = diff_df.filter(
+                (pl.col('time_delta_seconds') >= MIN_TIME_DELTA_SECONDS) &
+                (pl.col('sector_delta') >= 0)  # Cumulative counters shouldn't decrease
+            )
 
-            # Convert to GB/s: (sectors * 512 bytes) / (time in seconds) / (bytes in GB)
-            # Handle division by zero with conditional logic to prevent errors
-            df = df.with_columns([
-                pl.when(pl.col('total_ticks') > 0)
-                .then((pl.col('total_sectors') * 512) / pl.col('total_ticks') / (1024 ** 3))
-                .otherwise(0)
+            # Perform rate calculation only on valid rows
+            rate_df = rate_df.with_columns([
+                (((pl.col('sector_delta') * SECTOR_SIZE_BYTES) / pl.col('time_delta_seconds')) * BYTES_TO_GB)
+                .clip(lower_bound=0)  # Ensure non-negative rate
                 .alias('Value')
             ])
 
-            # Transform to Anvil schema with standardized column names and formats
-            # Event type 'block' represents block device I/O throughput
-            return df.select([
+            # 5. Transform to Anvil schema
+            return rate_df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+                pl.col('Timestamp'),
                 pl.lit('block').alias('Event'),
                 pl.col('Value'),
                 pl.lit('GB/s').alias('Units')
             ])
+
         except Exception as e:
-            logger.error(f"Error processing block file {file_path}: {e}")
+            logger.error(f"Error processing block file {file_path}: {e}", exc_info=True)
             return None
 
-    def process_cpu_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform CPU usage metrics into Anvil format
+    def process_cpu_file(self, file_path: Path) -> Union[pl.DataFrame, None]:
+        """Transform CPU usage metrics into Anvil format (Host Aggregated User%).
 
-        Calculates CPU user mode percentage by:
-        1. Computing total CPU ticks across all states
-        2. Determining the percentage of user+nice ticks relative to total
-        3. Ensuring values are in valid percentage range (0-100%)
-
-        This matches Anvil's 'cpuuser' metric which represents user-space CPU utilization
+        Calculates CPU user mode percentage relative to *active* time by:
+        1. Summing cumulative CPU time components across all cores per host/timestamp.
+        2. Calculating total aggregated active time (all states except idle).
+        3. Calculating total aggregated user+nice time.
+        4. Determining the percentage of user+nice time relative to active time.
+        5. Ensuring values are in valid percentage range (0-100%).
         """
         logger.info(f"Processing CPU file: {file_path}")
-        try:
-            df = pl.read_csv(file_path)
+        cpu_time_cols = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq']
+        dtypes = {col: pl.Float64 for col in cpu_time_cols}
+        df = self._read_csv_robust(file_path, dtypes=dtypes)
+        if df is None: return None
 
-            # Calculate total CPU ticks across all CPU states
-            # This forms the denominator for percentage calculation
+        try:
+            # 1. Prepare data: Cast, Parse Timestamp
             df = df.with_columns([
-                (pl.col('user') + pl.col('nice') + pl.col('system') +
-                 pl.col('idle') + pl.col('iowait') + pl.col('irq') +
-                 pl.col('softirq')).alias('total_ticks')
+                pl.col(col).fill_null(0).cast(pl.Float64) for col in cpu_time_cols
+            ]).with_columns(
+                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S", strict=False).alias('Timestamp')
+            ).drop_nulls(subset=['Timestamp', 'jobID', 'node'])
+
+            # 2. Aggregate CPU times per host/timestamp
+            group_keys_ts = ['jobID', 'node', 'Timestamp']
+            aggregated_df = df.group_by(group_keys_ts, maintain_order=True).agg([
+                pl.sum(col).alias(col) for col in cpu_time_cols
             ])
 
-            # Calculate percentage of CPU time spent in user mode (user + nice)
-            # Clip values to 0-100% range to handle any potential data anomalies
-            df = df.with_columns([
-                pl.when(pl.col('total_ticks') > 0)
-                .then(((pl.col('user') + pl.col('nice')) / pl.col('total_ticks')) * 100)
-                .otherwise(0)
-                .clip(0, 100)
+            # 3. Calculate percentage on aggregated data
+            aggregated_df = aggregated_df.with_columns([
+                (pl.col('user') + pl.col('nice') + pl.col('system') +
+                 pl.col('iowait') + pl.col('irq') + pl.col('softirq')).alias('total_active'),
+                (pl.col('user') + pl.col('nice')).alias('total_user_nice')
+            ])
+
+            aggregated_df = aggregated_df.with_columns([
+                pl.when(pl.col('total_active') > 0)
+                .then((pl.col('total_user_nice') / pl.col('total_active')) * 100)
+                .otherwise(0.0)  # Set to float 0.0
+                .clip(lower_bound=0.0, upper_bound=100.0)  # Use floats for bounds
                 .alias('Value')
             ])
 
-            # Transform to Anvil schema with standardized column names
-            # Event type 'cpuuser' represents CPU utilization in user mode
-            return df.select([
+            # 4. Transform to Anvil schema
+            return aggregated_df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+                pl.col('Timestamp'),
                 pl.lit('cpuuser').alias('Event'),
                 pl.col('Value'),
                 pl.lit('CPU %').alias('Units')
             ])
+
         except Exception as e:
-            logger.error(f"Error processing CPU file {file_path}: {e}")
+            logger.error(f"Error processing CPU file {file_path}: {e}", exc_info=True)
             return None
 
-    def process_nfs_file(self, file_path: Path) -> pl.DataFrame:
-        """Transform NFS traffic metrics into Anvil format
+    def process_llite_file(self, file_path: Path) -> Union[pl.DataFrame, None]:
+        """Transform Lustre ('llite') traffic metrics into Anvil format (Host Aggregated MB/s).
 
-        Calculates NFS throughput (MB/s) by:
-        1. Summing bytes received during READ operations and bytes sent during WRITE operations
-        2. Converting to MB by dividing by (1024*1024)
-        3. Computing the rate by dividing cumulative bytes by time elapsed between measurements
-
-        This provides a measure of network file system activity matching Anvil's 'nfs' metric
+        Calculates Lustre filesystem throughput rate (MB/s) over wall-clock time by:
+        1. Summing cumulative read/write bytes across all mounts per host/timestamp.
+        2. Calculating the change (delta) in total bytes between consecutive timestamps.
+        3. Calculating the change (delta) in wall-clock time.
+        4. Calculating Rate = (Byte Delta) / Time Delta (seconds).
+        5. Converting Bytes/s to MB/s. Maps event type to 'nfs' for Anvil standard.
         """
-        logger.info(f"Processing NFS file: {file_path}")
+        logger.info(f"Processing Lustre (llite) file: {file_path}")
+        dtypes = {'read_bytes': pl.Float64, 'write_bytes': pl.Float64}
+        df = self._read_csv_robust(file_path, dtypes=dtypes)
+        if df is None: return None
+
         try:
-            df = pl.read_csv(file_path)
-
-            # Calculate total NFS traffic by combining READ bytes received and WRITE bytes sent
-            # Convert to MB for consistent reporting in Anvil
+            # 1. Prepare data: Cast, Parse Timestamp, Calculate total bytes per row
             df = df.with_columns([
-                ((pl.col('READ_bytes_recv') + pl.col('WRITE_bytes_sent')) / (1024 * 1024)).alias('Value'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp')
+                pl.col('read_bytes').fill_null(0).cast(pl.Float64),
+                pl.col('write_bytes').fill_null(0).cast(pl.Float64),
+                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S", strict=False).alias('Timestamp'),
+                (pl.col('read_bytes') + pl.col('write_bytes')).alias('total_bytes')
+            ]).drop_nulls(subset=['Timestamp', 'jobID', 'node'])
+
+            # 2. Aggregate bytes per host/timestamp
+            group_keys_ts = ['jobID', 'node', 'Timestamp']
+            aggregated_df = df.group_by(group_keys_ts, maintain_order=True).agg(
+                pl.sum('total_bytes').alias('sum_total_bytes')
+            )
+
+            # 3. Calculate deltas within each host group
+            group_keys_host = ['jobID', 'node']
+            # Ensure sorting before applying window functions like diff
+            aggregated_df = aggregated_df.sort(group_keys_ts)
+
+            diff_df = aggregated_df.with_columns([
+                pl.col('sum_total_bytes').diff().over(group_keys_host).alias('byte_delta'),
+                pl.col('Timestamp').diff().over(group_keys_host).dt.total_seconds().alias('time_delta_seconds')
             ])
 
-            # Calculate time differences between consecutive rows to convert cumulative counters to rates
-            # Default to 600 seconds (10 minutes) for first measurement or missing intervals
-            df = df.with_columns([
-                pl.col('Timestamp').diff().cast(pl.Duration).dt.total_seconds().fill_null(600).alias('TimeDiff')
+            # 4. Calculate Rate (MB/s)
+            # Filter out invalid deltas
+            rate_df = diff_df.filter(
+                (pl.col('time_delta_seconds') >= MIN_TIME_DELTA_SECONDS) &
+                (pl.col('byte_delta') >= 0)  # Cumulative counters shouldn't decrease
+            )
+
+            # Perform rate calculation only on valid rows
+            rate_df = rate_df.with_columns([
+                ((pl.col('byte_delta') / pl.col('time_delta_seconds')) * BYTES_TO_MB)
+                .clip(lower_bound=0)  # Ensure non-negative rate
+                .alias('Value')
             ])
 
-            # Calculate rate by dividing accumulated data by time interval
-            # This converts cumulative byte counters to throughput in MB/s
-            df = df.with_columns([
-                (pl.col('Value') / pl.col('TimeDiff')).alias('Value')
-            ])
-
-            # Transform to Anvil schema with standardized column names
-            # Event type 'nfs' represents network file system throughput
-            return df.select([
+            # 5. Transform to Anvil schema (mapping event to 'nfs')
+            return rate_df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
-                pl.lit('nfs').alias('Event'),
+                pl.col('Timestamp'),
+                pl.lit('nfs').alias('Event'),  # Standard Anvil event name
                 pl.col('Value'),
                 pl.lit('MB/s').alias('Units')
             ])
+
         except Exception as e:
-            logger.error(f"Error processing NFS file {file_path}: {e}")
+            logger.error(f"Error processing llite file {file_path}: {e}", exc_info=True)
             return None
 
-    def process_memory_metrics(self, file_path: Path) -> List[pl.DataFrame]:
-        """Transform memory usage metrics into Anvil format
+    def process_memory_metrics(self, file_path: Path) -> Union[pl.DataFrame, None]:
+        """Transform memory usage metrics (per-node) into Anvil format (GB).
 
-        Calculates two memory metrics:
-        1. Total memory usage (memused) - All physical memory used by the OS
-        2. Memory usage excluding disk cache (memused_minus_diskcache) - Memory used by applications
+        Processes memory data assuming input units are Bytes and data is per-node
+        (as per documentation, ignoring 'device' column if present). Calculates:
+        1. Total memory usage ('memused') = MemUsed
+        2. Memory usage excluding disk cache ('memused_minus_diskcache') = MemUsed - FilePages
 
-        Both metrics are converted to GB to align with Anvil's standardized reporting
+        Both metrics are converted from Bytes to GB.
         """
         logger.info(f"Processing memory file: {file_path}")
+        # Define expected columns and their types (assuming input is Bytes)
+        memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
+        dtypes = {col: pl.Float64 for col in memory_cols}
+        df = self._read_csv_robust(file_path, dtypes=dtypes)
+        if df is None: return None
+
         try:
-            df = pl.read_csv(file_path)
-
-            # Memory values in source data are in KB, convert to bytes for precision
-            # during calculations by multiplying by 1024
-            memory_cols = ['MemTotal', 'MemFree', 'MemUsed', 'FilePages']
+            # 1. Prepare data: Cast to float, Parse Timestamp
+            # Do NOT multiply by 1024 - context confirms input is Bytes.
             df = df.with_columns([
-                pl.col(col).mul(1024) for col in memory_cols if col in df.columns
-            ])
+                pl.col(col).fill_null(0).cast(pl.Float64) for col in memory_cols if col in df.columns
+            ]).with_columns(
+                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S", strict=False).alias('Timestamp')
+            ).drop_nulls(
+                subset=['Timestamp', 'jobID', 'node', 'MemUsed', 'FilePages'])  # Ensure necessary columns are non-null
 
-            # Calculate memory metrics in GB for Anvil standardization:
-            # 1. Total memory used by the system
-            # 2. Memory used excluding disk cache (FilePages represents cache)
-            # The .clip(0, None) prevents negative values that could occur due to timing differences
+            # 2. Calculate memory metrics in GB (no aggregation needed per context)
+            # Clip(lower_bound=0) ensures non-negative values.
             df = df.with_columns([
-                (pl.col('MemUsed') / (1024 ** 3)).alias('memused'),
-                ((pl.col('MemUsed') - pl.col('FilePages')) / (1024 ** 3))
-                .clip(0, None)
+                (pl.col('MemUsed') * BYTES_TO_GB).clip(lower_bound=0).alias('memused'),
+                ((pl.col('MemUsed') - pl.col('FilePages')) * BYTES_TO_GB)
+                .clip(lower_bound=0)
                 .alias('memused_minus_diskcache')
             ])
 
-            # Create Anvil-formatted DataFrame for total memory usage
+            # 3. Create Anvil-formatted DataFrame for 'memused'
             memused_df = df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+                pl.col('Timestamp'),
                 pl.lit('memused').alias('Event'),
                 pl.col('memused').alias('Value'),
                 pl.lit('GB').alias('Units')
             ])
 
-            # Create Anvil-formatted DataFrame for memory usage excluding disk cache
+            # 4. Create Anvil-formatted DataFrame for 'memused_minus_diskcache'
             memused_nocache_df = df.select([
                 pl.col('jobID').str.replace_all('job', 'JOB', literal=True).alias('Job Id'),
                 pl.col('node').alias('Host'),
-                pl.col('timestamp').str.strptime(pl.Datetime, "%m/%d/%Y %H:%M:%S").alias('Timestamp'),
+                pl.col('Timestamp'),
                 pl.lit('memused_minus_diskcache').alias('Event'),
                 pl.col('memused_minus_diskcache').alias('Value'),
                 pl.lit('GB').alias('Units')
             ])
 
-            # Return both metrics as a list of DataFrames to be concatenated later
+            # Return both metrics as a list of DataFrames
             return [memused_df, memused_nocache_df]
+
         except Exception as e:
-            logger.error(f"Error processing memory file {file_path}: {e}")
+            logger.error(f"Error processing memory file {file_path}: {e}", exc_info=True)
             return None
 
-    def process_node_data(self) -> pl.DataFrame:
+    # --- Orchestration Method ---
+
+    def process_node_data(self) -> Union[pl.DataFrame, None]:
         """Process all metrics for a node and combine into a unified Anvil-format DataFrame
 
-        This function orchestrates the processing of different metric types (block, CPU, NFS, memory)
-        and combines them into a single DataFrame conforming to the Anvil schema:
-        - Job Id: Unique job identifier (standardized format)
-        - Host: Origin node where data was gathered
-        - Timestamp: When the data point was recorded
-        - Event: Resource usage metric type (block, cpuuser, nfs, memused, memused_minus_diskcache)
-        - Value: Numeric metric value
-        - Units: Measurement unit (GB/s, CPU %, MB/s, GB)
+        Orchestrates the processing of different metric types (block, CPU, llite, memory)
+        by calling the respective processing functions and concatenating the results.
+        Removes processed source files from the cache directory.
         """
-        logger.info(f"Processing all files for node in directory: {self.cache_dir}")
+        logger.info(f"Processing all metric files in directory: {self.cache_dir}")
 
-        dfs = []
-        try:
-            # Process each metric type if the corresponding file exists
-            # For each file: read, transform, append to list, then remove to save space
+        all_processed_dfs = []
+        files_to_process = {
+            'block': (self.cache_dir / 'block.csv', self.process_block_file),
+            'cpu': (self.cache_dir / 'cpu.csv', self.process_cpu_file),
+            'llite': (self.cache_dir / 'llite.csv', self.process_llite_file),  # Changed from nfs
+            'memory': (self.cache_dir / 'mem.csv', self.process_memory_metrics),
+        }
 
-            # Process block device I/O metrics
-            block_path = self.cache_dir / 'block.csv'
-            if block_path.exists() and block_path.stat().st_size > 0:
-                block_df = self.process_block_file(block_path)
-                if isinstance(block_df, pl.DataFrame) and len(block_df) > 0:
-                    dfs.append(block_df)
-                # Delete file after processing
-                os.remove(block_path)
+        for metric_name, (file_path, process_func) in files_to_process.items():
+            logger.info(f"Checking for {metric_name} file: {file_path}")
+            if file_path.exists() and file_path.stat().st_size > 0:
+                try:
+                    result = process_func(file_path)
 
-            # Process CPU utilization metrics
-            cpu_path = self.cache_dir / 'cpu.csv'
-            if cpu_path.exists() and cpu_path.stat().st_size > 0:
-                cpu_df = self.process_cpu_file(cpu_path)
-                if isinstance(cpu_df, pl.DataFrame) and len(cpu_df) > 0:
-                    dfs.append(cpu_df)
-                # Delete file after processing
-                os.remove(cpu_path)
+                    # Handle results: None, single DataFrame, or list of DataFrames (for memory)
+                    if isinstance(result, pl.DataFrame) and result.height > 0:
+                        all_processed_dfs.append(result)
+                        logger.info(f"Successfully processed {metric_name}. Added {result.height} rows.")
+                    elif isinstance(result, list):  # Handle memory's list output
+                        valid_dfs_in_list = [df for df in result if isinstance(df, pl.DataFrame) and df.height > 0]
+                        if valid_dfs_in_list:
+                            all_processed_dfs.extend(valid_dfs_in_list)
+                            total_rows = sum(df.height for df in valid_dfs_in_list)
+                            logger.info(
+                                f"Successfully processed {metric_name}. Added {total_rows} rows from {len(valid_dfs_in_list)} DataFrame(s).")
+                        else:
+                            logger.warning(
+                                f"Processed {metric_name} file, but no valid data rows were generated in the list.")
+                    elif result is None or (isinstance(result, pl.DataFrame) and result.height == 0):
+                        logger.warning(f"Processed {metric_name} file, but no valid data rows were generated.")
+                    else:
+                        logger.warning(
+                            f"Processing function for {metric_name} returned unexpected type: {type(result)}")
 
-            # Process NFS throughput metrics
-            nfs_path = self.cache_dir / 'nfs.csv'
-            if nfs_path.exists() and nfs_path.stat().st_size > 0:
-                nfs_df = self.process_nfs_file(nfs_path)
-                if isinstance(nfs_df, pl.DataFrame) and len(nfs_df) > 0:
-                    dfs.append(nfs_df)
-                # Delete file after processing
-                os.remove(nfs_path)
+                    # Delete file after attempting processing (success or failure)
+                    try:
+                        os.remove(file_path)
+                        logger.info(f"Removed processed source file: {file_path}")
+                    except OSError as e:
+                        logger.error(f"Failed to remove source file {file_path}: {e}")
 
-            # Process memory usage metrics (produces two DataFrames)
-            mem_path = self.cache_dir / 'mem.csv'
-            if mem_path.exists() and mem_path.stat().st_size > 0:
-                memory_dfs = self.process_memory_metrics(mem_path)
-                if memory_dfs is not None and len(memory_dfs) > 0:
-                    dfs.extend(memory_dfs)
-                # Delete file after processing
-                os.remove(mem_path)
+                except Exception as e:
+                    logger.error(f"Critical error calling processing function for {metric_name} file {file_path}: {e}",
+                                 exc_info=True)
+                    # Optionally try to remove file even after critical error
+                    if file_path.exists():
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"Removed source file {file_path} after critical processing error.")
+                        except OSError as re:
+                            logger.error(f"Failed to remove source file {file_path} after critical error: {re}")
 
-            # Combine all DataFrames into a single Anvil-format DataFrame
-            if dfs:
-                # ThreadPoolExecutor is set up for potential future parallelization
-                # Currently, it simply wraps the DataFrames
-                with ThreadPoolExecutor(max_workers=max(1, multiprocessing.cpu_count() - 1)) as executor:
-                    # No actual parallel work here, but setting up the structure
-                    # for potential future parallelization of data transformations
-                    futures = [executor.submit(lambda df=df: df) for df in dfs]
-                    processed_dfs = [future.result() for future in futures]
-
-                # Concatenate all metrics into a unified DataFrame following Anvil schema
-                result = pl.concat(processed_dfs)
-                logger.info(f"Successfully processed node data with {len(result)} rows")
-                return result
             else:
-                logger.warning(f"No valid data processed for node in {self.cache_dir}")
-                return pl.DataFrame()
+                logger.info(f"Skipping {metric_name}: File not found or is empty at {file_path}")
 
-        except Exception as e:
-            logger.error(f"Error processing node data in {self.cache_dir}: {e}")
-            return pl.DataFrame()
+        # Combine all DataFrames into a single Anvil-format DataFrame
+        if all_processed_dfs:
+            try:
+                logger.info(f"Concatenating results from {len(all_processed_dfs)} processed DataFrame(s)...")
+                # Use low_memory=True if concatenating many large frames, may increase memory usage temporarily
+                final_result = pl.concat(all_processed_dfs, how='vertical')
+                logger.info(f"Successfully combined node data into final DataFrame with {final_result.height} rows.")
+                if final_result.height == 0:
+                    logger.warning("Concatenation resulted in an empty DataFrame.")
+                    return None
+                return final_result
+            except Exception as e:
+                logger.error(f"Failed to concatenate processed DataFrames: {e}", exc_info=True)
+                return None  # Return None on concatenation error
+        else:
+            logger.warning(f"No valid data processed from any metric file in {self.cache_dir}")
+            return None  # Return None explicitly if nothing was processed
