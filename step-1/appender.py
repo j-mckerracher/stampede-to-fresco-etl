@@ -4,14 +4,10 @@ import shutil
 import uuid
 import re
 import pandas as pd
-import pyarrow.parquet as pq
-import pyarrow as pa
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from concurrent.futures import ThreadPoolExecutor
 import threading
-import logging
-import sys
 
 
 # --- Logging Setup ---
@@ -33,10 +29,10 @@ MAX_RETRIES = 5
 RETRY_DELAY_BASE = 2  # Base delay in seconds
 
 # Configure your folders (use raw strings for Windows paths)
-WATCH_FOLDER = r"P:\Stampede\step-1-staging"
-PROCESSING_FOLDER = r"P:\Stampede\step-1-staging\processing"
-OUTPUT_FOLDER = r"P:\Stampede\step-1-result"
-ERROR_FOLDER = r"P:\Stampede\step-1-error"  # Add an error folder
+WATCH_FOLDER = r"C:\Users\jmckerra\Documents\Stampede\step-1-staging"
+PROCESSING_FOLDER = r"C:\Users\jmckerra\Documents\Stampede\processing"
+OUTPUT_FOLDER = r"C:\Users\jmckerra\Documents\Stampede\step-1-complete"
+ERROR_FOLDER = ""
 
 
 # --- End Configuration ---
