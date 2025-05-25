@@ -10,7 +10,7 @@ from watchdog.events import FileSystemEventHandler
 # --- Configuration ---
 # Use raw strings (r"...") or double backslashes ("\\") for Windows paths
 SOURCE_DIR = r"U:\projects\stampede-step-1\output"
-DEST_DIR = r"P:\Stampede\step-1-staging"
+DEST_DIR = r"C:\Users\jmckerra\Documents\Stampede\step-1-staging"
 POLL_INTERVAL_SECONDS = 1  # How often watchdog checks (lower for faster detection)
 NUM_WORKER_THREADS = 10  # Adjust based on network/disk speed, start with 1 or 2
 # --- End Configuration ---

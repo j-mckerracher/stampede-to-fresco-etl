@@ -28,7 +28,7 @@ def log_error(msg): print(f"ERROR: {msg}")
 
 # --- Configuration ---
 # !! CRITICAL !! Reduce workers significantly, especially with network/slow storage
-MAX_WORKERS = 4  # Start low (e.g., 2-4) and increase cautiously ONLY if P: drive is stable
+MAX_WORKERS = 12  # Start low (e.g., 2-4) and increase cautiously ONLY if P: drive is stable
 MAX_RETRIES = 5
 # Increase delay slightly, maybe add exponential backoff later if needed
 RETRY_DELAY_BASE = 2  # Base delay in seconds
