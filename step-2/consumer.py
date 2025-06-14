@@ -17,14 +17,14 @@ import psutil
 from tqdm import tqdm
 
 # --- Configuration ---
-BASE_SHARED_PATH = Path("/home/dynamo/a/jmckerra/projects/stampede-step-3")
+BASE_SHARED_PATH = Path("/home/dynamo/a/jmckerra/projects/stampede-step-2")
 SERVER_INPUT_DIR = BASE_SHARED_PATH / "input"
 SERVER_OUTPUT_DIR = BASE_SHARED_PATH / "output"  # Intermediate results
 SERVER_COMPLETE_DIR = BASE_SHARED_PATH / "complete"  # Final results and status
 LOG_DIR = BASE_SHARED_PATH / "logs"
 
 MAX_MEMORY_PERCENT: int = 80  # Trigger intermediate writes above this %
-PROCESSING_CHUNK_DURATION: timedelta = timedelta(minutes=5)
+PROCESSING_CHUNK_DURATION: timedelta = timedelta(minutes=1)
 # Define the exact output columns required
 OUTPUT_COLUMNS = [
     "time", "submit_time", "start_time", "end_time", "timelimit", "nhosts",
@@ -616,14 +616,14 @@ def process_job(
                 logger.info("Loading accounting data...")
                 # Load lazy, preprocess (incl. normalize jid), then collect
                 accounting_lazy = load_accounting_data(accounting_files)
-                accounting_df = accounting_lazy.collect(streaming=True)  # Use streaming if data might be large
+                accounting_df = accounting_lazy.collect(engine='streaming')  # Use streaming if data might be large
                 logger.info(f"Accounting data loaded and preprocessed: {accounting_df.shape}.")
 
             with timing("Loading and preprocessing metric data"):
                 logger.info("Loading sorted metric data...")
                 # Load lazy, preprocess (incl. normalize jid), then collect
                 metrics_lazy = load_sorted_metric_data(metric_files)
-                metrics_df = metrics_lazy.collect(streaming=True)  # Use streaming
+                metrics_df = metrics_lazy.collect(engine='streaming')  # Use streaming
                 logger.info(f"Metric data loaded and preprocessed: {metrics_df.shape}.")
 
             # Check for empty dataframes after loading and preprocessing
@@ -814,7 +814,6 @@ def process_manifest(manifest_path: Path) -> None:
 # --- Main Loop ---
 def main() -> None:
     """Main function: continuously finds and processes job manifests."""
-    # (Keep existing implementation - seems correct)
     try:
         setup_directories()
     except Exception:

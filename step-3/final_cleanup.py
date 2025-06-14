@@ -7,11 +7,11 @@ import time
 from typing import Union
 
 # --- Configuration ---
-ROOT_DIR = Path("/home/dynamo/a/jmckerra/projects/stampede-step-4/input")
+ROOT_DIR = Path("/home/dynamo/a/jmckerra/projects/stampede-step-3/input")
 # Adjust based on your system's cores, leave some for the OS
 # os.cpu_count() can give the total number of logical cores
 # Start with slightly less than os.cpu_count() and adjust based on performance
-NUM_WORKERS = 4
+NUM_WORKERS = 100
 
 # Configure logging for better tracking (include process ID for parallel runs)
 logging.basicConfig(level=logging.DEBUG,

@@ -356,13 +356,6 @@ def start_monitoring(watch_folder, processing_folder, output_folder, error_folde
         event_handler = ParquetHandler(watch_folder, processing_folder, output_folder, error_folder, executor)
 
         # --- Crucial Pre-computation Note ---
-        log_info("--- IMPORTANT PRE-COMPUTATION NOTE ---")
-        log_warning(f"The stability of this script heavily depends on the reliability of the storage at 'P:'.")
-        log_warning(f"WinError 1117 indicates an underlying I/O device error. Please investigate:")
-        log_warning(f"  1. Network connection/stability if P: is a network drive.")
-        log_warning(f"  2. Health of the drive if P: is local or external.")
-        log_warning(f"  3. Check for other processes heavily accessing P: simultaneously.")
-        log_warning(f"  4. Ensure adequate permissions on all folders.")
         log_warning(f"Using {MAX_WORKERS} worker threads. Reduce this number if I/O errors persist.")
         log_info("------------------------------------")
         time.sleep(5)  # Give user time to read warnings

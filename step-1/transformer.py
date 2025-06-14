@@ -22,13 +22,13 @@ NODE_DIR_PATTERN = re.compile(r'^(NODE\d+)/$')
 NETWORK_RETRIES = 3
 NETWORK_WAIT_SECONDS = 3
 REQUEST_TIMEOUT = 60
-WRITE_BATCH_SIZE = 1000  # Number of NODES to process before writing
+WRITE_BATCH_SIZE = 500  # Number of NODES to process before writing
 # --- End Configuration ---
 
 
 # --- Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),

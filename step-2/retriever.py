@@ -10,12 +10,12 @@ import traceback
 
 # --- Configuration ---
 # Final destination for successfully processed data
-DESTINATION_DIR = Path(r"C:\Users\jmckerra\Documents\Stampede\step-3-complete")
+DESTINATION_DIR = Path(r"C:\Users\jmckerra\Documents\Stampede\step-2-complete")
 
 # Directories shared with the Consumer/Sender for coordination
-SERVER_INPUT_DIR = Path(r"U:\projects\stampede-step-3\input")  # Needed for cleanup
-SERVER_OUTPUT_DIR = Path(r"U:\projects\stampede-step-3\output")  # Needed for cleanup
-SERVER_COMPLETE_DIR = Path(r"U:\projects\stampede-step-3\complete")  # Primary dir to check for status
+SERVER_INPUT_DIR = Path(r"U:\projects\stampede-step-2\input")  # Needed for cleanup
+SERVER_OUTPUT_DIR = Path(r"U:\projects\stampede-step-2\output")  # Needed for cleanup
+SERVER_COMPLETE_DIR = Path(r"U:\projects\stampede-step-2\complete")  # Primary dir to check for status
 
 # Local directories for the Retriever/Finalizer
 LOGS_DIR = Path("logs_retriever")  # Separate log dir
